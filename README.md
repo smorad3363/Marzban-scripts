@@ -40,17 +40,21 @@ sudo bash -c "$(curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/
 
 
 ## Installing Marzban-node
+This fork keeps the Node installer self-update path under `smorad3363` while retaining
+`gozargah/Marzban-scripts` as the upstream remote. For reproducible production
+installation, use the commit-pinned URL recorded by the Marzban release documentation.
+
 Install Marzban-node on your server using this command
 ```bash
-sudo bash -c "$(curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh)" @ install
+sudo bash -c "$(curl -sL https://github.com/smorad3363/Marzban-scripts/raw/master/marzban-node.sh)" @ install
 ```
 Install Marzban-node on your server using this command with custom name:
 ```bash
-sudo bash -c "$(curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh)" @ install --name marzban-node2
+sudo bash -c "$(curl -sL https://github.com/smorad3363/Marzban-scripts/raw/master/marzban-node.sh)" @ install --name marzban-node2
 ```
 Or you can only install this script (marzban-node command) on your server by using this command
 ```bash
-sudo bash -c "$(curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh)" @ install-script
+sudo bash -c "$(curl -sL https://github.com/smorad3363/Marzban-scripts/raw/master/marzban-node.sh)" @ install-script
 ```
 
 Use `help` to view all commands:
