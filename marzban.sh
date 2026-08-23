@@ -1403,6 +1403,32 @@ cli_command() {
     marzban_cli "$@"
 }
 
+set_owner_command() {
+    if [ "$#" -eq 0 ]; then
+        cli_command admin set-owner
+        return
+    fi
+
+    if [ "$#" -eq 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
+        colorized_echo blue "Usage: marzban set-owner [username]"
+        cli_command admin set-owner --help
+        return
+    fi
+
+    if [ "$#" -eq 1 ]; then
+        cli_command admin set-owner --username "$1"
+        return
+    fi
+
+    if [ "$#" -eq 2 ] && { [ "$1" = "-u" ] || [ "$1" = "--username" ]; }; then
+        cli_command admin set-owner --username "$2"
+        return
+    fi
+
+    colorized_echo red "Usage: marzban set-owner [username]"
+    exit 1
+}
+
 up_command() {
     help() {
         colorized_echo red "Usage: marzban up [options]"
@@ -1536,6 +1562,7 @@ usage() {
     colorized_echo yellow "  status          $(tput sgr0)– Show status"
     colorized_echo yellow "  logs            $(tput sgr0)– Show logs"
     colorized_echo yellow "  cli             $(tput sgr0)– Marzban CLI"
+    colorized_echo yellow "  set-owner       $(tput sgr0)– Select Owner and migrate the admin hierarchy"
     colorized_echo yellow "  install         $(tput sgr0)– Install Marzban"
     colorized_echo yellow "  update          $(tput sgr0)– Update to latest version"
     colorized_echo yellow "  uninstall       $(tput sgr0)– Uninstall Marzban"
@@ -1569,6 +1596,8 @@ case "$1" in
         shift; logs_command "$@";;
     cli)
         shift; cli_command "$@";;
+    set-owner)
+        shift; set_owner_command "$@";;
     backup)
         shift; backup_command "$@";;
     backup-service)

@@ -1,6 +1,21 @@
 # Marzban-scripts
 Scripts for Marzban
 
+## Set the system Owner
+
+After updating Marzban to a version that supports the Admin hierarchy, select an
+existing Admin as the Owner with:
+
+```bash
+marzban set-owner USERNAME
+```
+
+The equivalent command for servers that still have an older management script is:
+
+```bash
+marzban cli admin set-owner --username USERNAME
+```
+
 ## Installing Marzban
 - **Install Marzban with SQLite**:
 
