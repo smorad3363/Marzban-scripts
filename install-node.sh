@@ -17,7 +17,7 @@ reset='\033[0m'
 
 info() { printf '%b%s%b\n' "$blue" "$*" "$reset"; }
 ok() { printf '%b%s%b\n' "$green" "$*" "$reset"; }
-warn() { printf '%b%s%b\n' "$yellow" "$*" "$reset"; }
+warn() { printf '%b%s%b\n' "$yellow" "$*" "$reset" >&2; }
 die() { printf '%bError: %s%b\n' "$red" "$*" "$reset" >&2; exit 1; }
 
 [[ "$(id -u)" == "0" ]] || die "This installer must be run as root."
