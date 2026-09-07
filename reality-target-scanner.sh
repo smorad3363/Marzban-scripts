@@ -2,8 +2,137 @@
 set -uo pipefail
 
 # Strict REALITY target scanner for Marzban/Xray in Docker.
-# Randomly samples public domains and stops after finding the requested number
-# of targets that pass REALITY-oriented TLS, PQ, certificate-size and stability checks.
+# Interactive launches detach with nohup so scans survive SSH disconnects.
+# Worker mode randomly samples public domains and stops after the requested
+# number of targets pass REALITY-oriented TLS, PQ, certificate-size and
+# stability checks.
+
+BASE_DIR="${BASE_DIR:-/root/reality-scans}"
+GLOBAL_PID_FILE="${GLOBAL_PID_FILE:-/run/reality-scan.pid}"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+
+show_status() {
+    local latest="$BASE_DIR/latest" pid=""
+    if [ -f "$GLOBAL_PID_FILE" ]; then
+        pid="$(cat "$GLOBAL_PID_FILE" 2>/dev/null || true)"
+    fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "RUNNING pid=$pid"
+    else
+        echo "NOT RUNNING"
+    fi
+    if [ -L "$latest" ] || [ -d "$latest" ]; then
+        echo "Latest run : $(readlink -f "$latest" 2>/dev/null || echo "$latest")"
+        [ -f "$latest/reality-scan.log" ] && echo "Log        : $latest/reality-scan.log"
+        [ -f "$latest/reality-healthy.txt" ] && echo "Healthy    : $latest/reality-healthy.txt"
+    fi
+}
+
+case "${1:-}" in
+    status)
+        show_status
+        exit 0
+        ;;
+    log|logs)
+        if [ -f "$BASE_DIR/latest/reality-scan.log" ]; then
+            tail -f "$BASE_DIR/latest/reality-scan.log"
+        else
+            echo "No scan log found yet."
+            exit 1
+        fi
+        ;;
+    results|result)
+        if [ -f "$BASE_DIR/latest/reality-healthy.txt" ]; then
+            cat "$BASE_DIR/latest/reality-healthy.txt"
+        else
+            echo "No healthy-target file found yet."
+            exit 1
+        fi
+        ;;
+    stop)
+        if [ -f "$GLOBAL_PID_FILE" ]; then
+            pid="$(cat "$GLOBAL_PID_FILE" 2>/dev/null || true)"
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid"
+                echo "Stop signal sent to scan pid=$pid"
+                exit 0
+            fi
+        fi
+        echo "No running scan found."
+        exit 0
+        ;;
+esac
+
+# Interactive launcher. Ask how many healthy targets are wanted, then launch
+# the real worker detached from the SSH session.
+if [ "${REALITY_SCAN_WORKER:-0}" != "1" ]; then
+    mkdir -p "$BASE_DIR"
+
+    if [ -f "$GLOBAL_PID_FILE" ]; then
+        old_pid="$(cat "$GLOBAL_PID_FILE" 2>/dev/null || true)"
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            echo "[!] A scan is already running (pid=$old_pid)."
+            show_status
+            echo "Use: reality-scan logs"
+            exit 1
+        fi
+        rm -f "$GLOBAL_PID_FILE"
+    fi
+
+    default_needed="${NEEDED:-50}"
+    if [ -n "${1:-}" ] && [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; then
+        wanted="$1"
+    elif [ -t 0 ]; then
+        while true; do
+            printf 'How many healthy REALITY targets do you want? [%s]: ' "$default_needed"
+            IFS= read -r wanted
+            wanted="${wanted:-$default_needed}"
+            if [[ "$wanted" =~ ^[1-9][0-9]*$ ]]; then
+                break
+            fi
+            echo "Please enter a positive integer."
+        done
+    else
+        wanted="$default_needed"
+    fi
+
+    run_id="$(date +%Y%m%d-%H%M%S)"
+    run_dir="$BASE_DIR/$run_id"
+    mkdir -p "$run_dir"
+    ln -sfn "$run_dir" "$BASE_DIR/latest"
+
+    log_file="$run_dir/reality-scan.log"
+    healthy_file="$run_dir/reality-healthy.txt"
+    report_file="$run_dir/reality-scan-report.txt"
+
+    nohup env \
+        REALITY_SCAN_WORKER=1 \
+        NEEDED="$wanted" \
+        OUT_DIR="$run_dir" \
+        BASE_DIR="$BASE_DIR" \
+        GLOBAL_PID_FILE="$GLOBAL_PID_FILE" \
+        bash "$SCRIPT_PATH" \
+        >"$log_file" 2>&1 </dev/null &
+
+    worker_pid=$!
+    printf '%s\n' "$worker_pid" > "$GLOBAL_PID_FILE"
+    printf '%s\n' "$worker_pid" > "$run_dir/reality-scan.pid"
+
+    echo
+    echo "[+] Scan started in background."
+    echo "    Requested : $wanted healthy targets"
+    echo "    PID       : $worker_pid"
+    echo "    Run dir   : $run_dir"
+    echo "    Log       : $log_file"
+    echo "    Results   : $healthy_file"
+    echo "    Report    : $report_file"
+    echo
+    echo "SSH can be disconnected; the scan will keep running."
+    echo "Check status : reality-scan status"
+    echo "Watch log    : reality-scan logs"
+    echo "Show results : reality-scan results"
+    exit 0
+fi
 
 NEEDED="${NEEDED:-50}"
 POOL_SIZE="${POOL_SIZE:-1000000}"
@@ -16,9 +145,9 @@ REQUIRE_PQ="${REQUIRE_PQ:-1}"
 EXCLUDE_CLOUDFLARE="${EXCLUDE_CLOUDFLARE:-1}"
 EXCLUDE_FASTLY="${EXCLUDE_FASTLY:-1}"
 MIN_XRAY_VERSION="${MIN_XRAY_VERSION:-25.7.26}"
-MAX_CANDIDATES="${MAX_CANDIDATES:-50000}"
+MAX_CANDIDATES="${MAX_CANDIDATES:-1000000}"
 
-OUT_DIR="${OUT_DIR:-/root}"
+OUT_DIR="${OUT_DIR:-/root/reality-scans/manual-$(date +%Y%m%d-%H%M%S)}"
 OUT="$OUT_DIR/reality-scan-report.txt"
 HEALTHY="$OUT_DIR/reality-healthy.txt"
 
@@ -34,7 +163,13 @@ mkdir -p "$OUT_DIR"
 : > "$HEALTHY"
 : > "$GOOD_RAW"
 
-cleanup() { rm -rf "$WORK"; }
+cleanup() {
+    rm -rf "$WORK"
+    if [ -f "$GLOBAL_PID_FILE" ]; then
+        current="$(cat "$GLOBAL_PID_FILE" 2>/dev/null || true)"
+        [ "$current" = "$$" ] && rm -f "$GLOBAL_PID_FILE"
+    fi
+}
 trap cleanup EXIT INT TERM
 
 log() { printf '%s\n' "$*"; }
@@ -297,10 +432,15 @@ else
     : > "$HEALTHY"
 fi
 
+# Compatibility copies for quick access to the latest completed/partial scan.
+cp -f "$HEALTHY" /root/reality-healthy.txt 2>/dev/null || true
+cp -f "$OUT" /root/reality-scan-report.txt 2>/dev/null || true
+
 log
 log "======================================================================"
 log "Selected Docker : $XRAY_NAME ($XRAY_IMAGE)"
 log "Xray version    : $XRAY_VERSION"
+log "Requested       : $NEEDED"
 log "Healthy found   : $FOUND"
 log "Healthy list    : $HEALTHY"
 log "Detailed report : $OUT"
