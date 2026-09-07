@@ -303,7 +303,7 @@ asname() {
 provider_from_asn() {
     case "$1" in
         54113) echo FASTLY ;;
-        13335) echo CLOUDFLARE ;;
+        13335|209242) echo CLOUDFLARE ;;
         20940) echo AKAMAI ;;
         16509|14618) echo AWS ;;
         15169) echo GOOGLE ;;
@@ -357,9 +357,23 @@ fast_probe() {
 
 # Stage 2: expensive REALITY checks only for fast-pass candidates.
 strict_probe() {
-    local line="$1" d ip a p tls cert xo rc sni pq=UNKNOWN pqrank=1 i t ms pass=0 med same=NO samerank=1
+    local line="$1" d ip a p an tls cert xo rc sni pq=UNKNOWN pqrank=1 i t ms pass=0 med same=NO samerank=1
     local times=()
     IFS='|' read -r d ip a p <<< "$line"
+
+    # Re-check provider from authoritative AS name here. This catches
+    # alternate Cloudflare/Fastly/Google ASNs without slowing the 1M prefilter.
+    an="$(asname "$a")"
+    if grep -Eqi 'cloudflare' <<< "$an"; then
+        p=CLOUDFLARE
+    elif grep -Eqi 'fastly' <<< "$an"; then
+        p=FASTLY
+    elif grep -Eqi 'google' <<< "$an"; then
+        p=GOOGLE
+    fi
+    [ "$p" != CLOUDFLARE ] || return 0
+    [ "$p" != FASTLY ] || return 0
+    [ "$p" != GOOGLE ] || return 0
 
     tls="$(timeout 7 openssl s_client -showcerts -connect "$ip:443" -servername "$d" -alpn h2 -tls1_3 -verify_return_error </dev/null 2>&1)"
     grep -Eqi 'TLSv1\.3|Protocol *: TLSv1\.3' <<< "$tls" || return 0
