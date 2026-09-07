@@ -52,7 +52,7 @@ show_status() {
         if { [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; } && [ -f "$l/reality-scan.log" ]; then
             echo "------------------------------------------------------------"
             echo "Last log lines:"
-            tail -n 12 "$l/reality-scan.log" 2>/dev/null || true
+            tail -n 14 "$l/reality-scan.log" 2>/dev/null || true
         fi
     fi
 }
@@ -66,13 +66,24 @@ show_results() {
         cat "$l/reality-ranked.txt"
         if [ -f "$l/progress.txt" ]; then
             echo
-            grep -E '^(Phase|Perfect|Benchmarked|Note)' "$l/progress.txt" 2>/dev/null || true
+            grep -E '^(Mode|Phase|Perfect|Benchmarked|Note|Tests/target)' "$l/progress.txt" 2>/dev/null || true
         fi
         return 0
     fi
 
     echo "No ranked results yet."
     [ -f "$l/progress.txt" ] && cat "$l/progress.txt"
+}
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  reality-scan
+  reality-scan 10
+  reality-scan "a.com,b.com,c.com"
+  QUALITY_RUNS=500 reality-scan "a.com,b.com,c.com"
+  reality-scan status|logs|results|stop
+USAGE
 }
 
 case "${1:-}" in
@@ -95,11 +106,23 @@ case "${1:-}" in
         echo "No running scan."
         exit 0
         ;;
-    ""|[1-9][0-9]*) ;;
-    *) echo "Usage: reality-scan [NUMBER|status|logs|results|stop]"; exit 1 ;;
+    -h|--help|help) usage; exit 0 ;;
 esac
 
-# Interactive launcher: detach so SSH disconnect does not stop the scan.
+normalize_domains() {
+    printf '%s\n' "$*" |
+        tr ',' '\n' |
+        awk '{
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+            d=tolower($0)
+            sub(/^https?:\/\//, "", d)
+            sub(/\/.*$/, "", d)
+            sub(/:443$/, "", d)
+            if (d ~ /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/ && !seen[d]++) print d
+        }'
+}
+
+# Launcher: detached, survives SSH disconnect.
 if [ "${REALITY_SCAN_WORKER:-0}" != "1" ]; then
     mkdir -p "$BASE"
 
@@ -113,9 +136,19 @@ if [ "${REALITY_SCAN_WORKER:-0}" != "1" ]; then
         rm -f "$PIDF"
     fi
 
+    INPUT="$*"
+    MODE="random"
+    CUSTOM_DOMAINS=""
     DEFAULT_N="${NEEDED:-50}"
-    if [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; then
+
+    if [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] && [ "$#" -eq 1 ]; then
         N="$1"
+    elif [ -n "$INPUT" ]; then
+        MODE="custom"
+        MAP="$(normalize_domains "$INPUT")"
+        N="$(printf '%s\n' "$MAP" | awk 'NF{n++}END{print n+0}')"
+        [ "$N" -gt 0 ] || { echo "[!] No valid domains found."; usage; exit 1; }
+        CUSTOM_DOMAINS="$(printf '%s\n' "$MAP" | awk 'NF{if(n++)printf ",";printf "%s",$0}END{print ""}')"
     else
         while :; do
             printf 'How many healthy REALITY targets do you want? [%s]: ' "$DEFAULT_N"
@@ -133,10 +166,13 @@ if [ "${REALITY_SCAN_WORKER:-0}" != "1" ]; then
 
     nohup env \
         REALITY_SCAN_WORKER=1 \
+        SCAN_MODE="$MODE" \
+        CUSTOM_DOMAINS="$CUSTOM_DOMAINS" \
         NEEDED="$N" \
         OUT_DIR="$RUN" \
         BASE_DIR="$BASE" \
         PID_FILE="$PIDF" \
+        QUALITY_RUNS="${QUALITY_RUNS:-20}" \
         bash "$SELF" >"$RUN/reality-scan.log" 2>&1 </dev/null &
 
     P=$!
@@ -147,7 +183,14 @@ if [ "${REALITY_SCAN_WORKER:-0}" != "1" ]; then
     echo "============================================================"
     echo " Scan started"
     echo "============================================================"
-    echo "Requested   : $N healthy targets"
+    echo "Mode        : $MODE"
+    if [ "$MODE" = custom ]; then
+        echo "Targets     : $N"
+        echo "Tests/target: ${QUALITY_RUNS:-20}"
+        echo "Domains     : $CUSTOM_DOMAINS"
+    else
+        echo "Requested   : $N healthy targets"
+    fi
     echo "PID         : $P"
     echo "Run dir     : $RUN"
     echo "Log         : $RUN/reality-scan.log"
@@ -161,6 +204,8 @@ if [ "${REALITY_SCAN_WORKER:-0}" != "1" ]; then
 fi
 
 N="${NEEDED:-50}"
+MODE="${SCAN_MODE:-random}"
+CUSTOM_DOMAINS="${CUSTOM_DOMAINS:-}"
 OUT="${OUT_DIR:?OUT_DIR is required}"
 MAXC="${MAX_CANDIDATES:-1000000}"
 PREFILTER_BATCH="${PREFILTER_BATCH:-500}"
@@ -174,14 +219,14 @@ CPU="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
 
 DEFAULT_FAST=$((CPU * 12)); [ "$DEFAULT_FAST" -lt 24 ] && DEFAULT_FAST=24; [ "$DEFAULT_FAST" -gt 64 ] && DEFAULT_FAST=64
 DEFAULT_STRICT=$((CPU * 3)); [ "$DEFAULT_STRICT" -lt 8 ] && DEFAULT_STRICT=8; [ "$DEFAULT_STRICT" -gt 24 ] && DEFAULT_STRICT=24
-DEFAULT_QUALITY=$((CPU * 2)); [ "$DEFAULT_QUALITY" -lt 4 ] && DEFAULT_QUALITY=4; [ "$DEFAULT_QUALITY" -gt 12 ] && DEFAULT_QUALITY=12
+DEFAULT_QUALITY=$((CPU * 2)); [ "$DEFAULT_QUALITY" -lt 4 ] && DEFAULT_QUALITY=4; [ "$DEFAULT_QUALITY" -gt 16 ] && DEFAULT_QUALITY=16
 
 FAST_WORKERS="${FAST_WORKERS:-$DEFAULT_FAST}"
 STRICT_WORKERS="${STRICT_WORKERS:-$DEFAULT_STRICT}"
 QUALITY_WORKERS="${QUALITY_WORKERS:-$DEFAULT_QUALITY}"
 
 EXTRA=$((N / 2)); [ "$EXTRA" -lt 10 ] && EXTRA=10; [ "$EXTRA" -gt 50 ] && EXTRA=50
-TARGET_POOL=$((N + EXTRA))
+if [ "$MODE" = custom ]; then TARGET_POOL="$N"; else TARGET_POOL=$((N + EXTRA)); fi
 
 REP="$OUT/reality-scan-report.txt"
 PRE="$OUT/reality-prefilter.raw"
@@ -216,9 +261,15 @@ log() { printf '%s\n' "$*"; }
 progress() {
     local phase="$1" scanned="${2:-0}" total="${3:-0}" pre="${4:-0}" strict="${5:-0}" bench="${6:-0}" perfect="${7:-0}" note="${8:-}"
     {
+        printf 'Mode        : %s\n' "$MODE"
         printf 'Phase       : %s\n' "$phase"
-        printf 'Requested   : %s\n' "$N"
-        printf 'Quality pool: %s\n' "$TARGET_POOL"
+        if [ "$MODE" = custom ]; then
+            printf 'Targets     : %s\n' "$N"
+            printf 'Tests/target: %s\n' "$QUALITY_RUNS"
+        else
+            printf 'Requested   : %s\n' "$N"
+            printf 'Quality pool: %s\n' "$TARGET_POOL"
+        fi
         printf 'Scanned     : %s / %s\n' "$scanned" "$total"
         printf 'Prefilter   : %s\n' "$pre"
         printf 'Strict      : %s\n' "$strict"
@@ -230,9 +281,14 @@ progress() {
     mv -f "$PROGRESS.tmp" "$PROGRESS"
 }
 
-for c in docker curl unzip awk grep shuf dig openssl timeout getent sort sed flock wc xargs head tail tr getconf date; do
+for c in docker curl awk grep dig openssl timeout getent sort sed flock wc xargs head tail tr getconf date; do
     command -v "$c" >/dev/null 2>&1 || { log "[!] Missing command: $c"; exit 1; }
 done
+if [ "$MODE" = random ]; then
+    for c in unzip shuf; do
+        command -v "$c" >/dev/null 2>&1 || { log "[!] Missing command: $c"; exit 1; }
+    done
+fi
 docker info >/dev/null 2>&1 || { log "[!] Docker unavailable."; exit 1; }
 
 version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
@@ -262,13 +318,18 @@ log
 log "============================================================"
 log " REALITY Target Scanner - turbo + ranked"
 log "============================================================"
+log "Mode        : $MODE"
 log "Docker      : $CNAME"
 log "Image       : $CIMAGE"
 log "Xray        : $XVER"
-log "Wanted      : $N"
-log "Pool target : $TARGET_POOL"
+if [ "$MODE" = custom ]; then
+    log "Targets     : $N"
+    log "Tests/target: $QUALITY_RUNS"
+else
+    log "Wanted      : $N"
+    log "Pool target : $TARGET_POOL"
+fi
 log "Workers     : fast=$FAST_WORKERS strict=$STRICT_WORKERS quality=$QUALITY_WORKERS"
-log "Benchmark   : $QUALITY_RUNS fresh TLS connections / target"
 log "============================================================"
 
 xping() { timeout 12 docker exec "$CID" "$XPATH" tls ping "$1" 2>&1; }
@@ -300,16 +361,27 @@ asname() {
         awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/,"",$5);print $5}'
 }
 
-provider_from_asn() {
-    case "$1" in
-        54113) echo FASTLY ;;
-        13335|209242) echo CLOUDFLARE ;;
-        20940) echo AKAMAI ;;
-        16509|14618) echo AWS ;;
-        15169) echo GOOGLE ;;
-        8075) echo MICROSOFT ;;
-        *) echo OTHER ;;
-    esac
+provider_name() {
+    local a="$1" name="${2:-}"
+    if grep -Eqi 'cloudflare' <<< "$name"; then echo CLOUDFLARE
+    elif grep -Eqi 'fastly' <<< "$name"; then echo FASTLY
+    elif grep -Eqi 'google' <<< "$name"; then echo GOOGLE
+    elif grep -Eqi 'amazon|aws' <<< "$name"; then echo AWS
+    elif grep -Eqi 'microsoft' <<< "$name"; then echo MICROSOFT
+    elif grep -Eqi 'akamai' <<< "$name"; then echo AKAMAI
+    elif grep -Eqi 'incapsula|imperva' <<< "$name"; then echo INCAPSULA
+    else
+        case "$a" in
+            54113) echo FASTLY ;;
+            13335|209242) echo CLOUDFLARE ;;
+            20940) echo AKAMAI ;;
+            16509|14618) echo AWS ;;
+            15169) echo GOOGLE ;;
+            8075) echo MICROSOFT ;;
+            19551) echo INCAPSULA ;;
+            *) echo OTHER ;;
+        esac
+    fi
 }
 
 median() {
@@ -335,14 +407,117 @@ certlen_from_tlsout() {
     [ "$cnt" -gt 0 ] && echo "$sum"
 }
 
-# Stage 1: cheap filter. One TLS handshake, no curl, no cert parsing.
+score_calc() {
+    local success="$1" runs="$2" med="$3" p95="$4" p99="$5" jit="$6" cert="$7" pq="$8" same="$9" ready="${10:-YES}"
+    awk -v ok="$success" -v n="$runs" -v med="$med" -v p95="$p95" -v p99="$p99" -v jit="$jit" -v cert="$cert" -v pq="$pq" -v same="$same" -v ready="$ready" '
+        BEGIN {
+            if (ready != "YES") { print 1; exit }
+            rel = (n>0 ? (ok/n)*500 : 0)
+            sm = 180 - med*0.60; if(sm>160)sm=160; if(sm<0)sm=0
+            s95 = 160 - p95*0.40; if(s95>140)s95=140; if(s95<0)s95=0
+            s99 = 100 - p99*0.20; if(s99>80)s99=80; if(s99<0)s99=0
+            sj = 60 - jit*0.50; if(sj>50)sj=50; if(sj<0)sj=0
+            c = (cert>=6500 ? 30 : (cert>=5000 ? 27 : (cert>=4000 ? 23 : (cert>3500 ? 18 : 0))))
+            q = (pq=="YES" ? 20 : (pq=="UNKNOWN" ? 10 : 0))
+            s = (same=="YES" ? 20 : 0)
+            total = int(rel+sm+s95+s99+sj+c+q+s+0.5)
+            if(total<1)total=1; if(total>1000)total=1000
+            print total
+        }'
+}
+
+# ----------------------- custom domain mode -----------------------
+custom_test_one() {
+    local d="$1" ip a an p tls tls13=NO h2=NO verify=NO cert=0 xo rc sni xraysni=NO pq=UNKNOWN same=NO ready=NO
+    local i t ms ok=0 med=99999 avg=99999 p95=99999 p99=99999 min=99999 max=99999 jit=99999 score=1 tmp aas
+
+    ip="$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u | head -1)"
+    if [ -n "$ip" ]; then
+        a="$(asn "$ip")"
+        an="$(asname "$a")"
+        p="$(provider_name "$a" "$an")"
+        aas="AS${a:-UNKNOWN}"
+
+        tls="$(timeout 8 openssl s_client -showcerts -connect "$ip:443" -servername "$d" -alpn h2 -tls1_3 -verify_return_error </dev/null 2>&1)"
+        grep -Eqi 'TLSv1\.3|Protocol *: TLSv1\.3' <<< "$tls" && tls13=YES
+        grep -Eqi 'ALPN protocol: h2' <<< "$tls" && h2=YES
+        grep -Eqi 'Verify return code: 0 \(ok\)|Verification: OK' <<< "$tls" && verify=YES
+        cert="$(certlen_from_tlsout "$tls" || echo 0)"
+        [[ "$cert" =~ ^[0-9]+$ ]] || cert=0
+
+        xo="$(xping "$d")"; rc=$?
+        if [ "$rc" -eq 0 ] && grep -Eqi 'tls ping finished' <<< "$xo"; then
+            sni="$(awk '/Pinging with SNI/{f=1;next} f{print}' <<< "$xo")"
+            grep -Eqi 'handshake succeeded' <<< "$sni" && xraysni=YES
+        fi
+        if grep -q 'TLS Post-Quantum key exchange:' <<< "$xo"; then
+            if grep -Eqi 'TLS Post-Quantum key exchange:.*true.*X25519MLKEM768' <<< "$xo"; then pq=YES; else pq=NO; fi
+        fi
+        if [ -n "$SASN" ] && [ "$a" = "$SASN" ]; then same=YES; fi
+
+        if [ "$tls13" = YES ] && [ "$h2" = YES ] && [ "$verify" = YES ] && [ "$xraysni" = YES ] && [ "$cert" -gt "$MIN_CERT_LENGTH" ]; then
+            ready=YES
+        fi
+
+        tmp="$(mktemp "$W/custom-times.XXXXXX")" || return 0
+        for ((i=1;i<=QUALITY_RUNS;i++)); do
+            t="$(curl -4 -sS -o /dev/null --connect-timeout 3 --max-time 8 -H 'Connection: close' -w '%{time_appconnect}' "https://$d/" 2>/dev/null)"; rc=$?
+            if [ "$rc" -eq 0 ] && [ -n "$t" ] && [ "$t" != 0.000000 ]; then
+                ms="$(awk -v x="$t" 'BEGIN{printf "%.0f",x*1000}')"
+                echo "$ms" >> "$tmp"
+                ok=$((ok+1))
+            fi
+        done
+        if [ "$ok" -gt 0 ]; then
+            sort -n "$tmp" -o "$tmp"
+            min="$(head -1 "$tmp")"; max="$(tail -1 "$tmp")"
+            avg="$(awk '{s+=$1}END{if(NR)printf "%.0f",s/NR}' "$tmp")"
+            med="$(awk '{a[NR]=$1}END{if(NR%2)printf "%.0f",a[(NR+1)/2];else printf "%.0f",(a[NR/2]+a[NR/2+1])/2}' "$tmp")"
+            p95="$(awk '{a[NR]=$1}END{n=int(NR*.95+.999999);if(n<1)n=1;print a[n]}' "$tmp")"
+            p99="$(awk '{a[NR]=$1}END{n=int(NR*.99+.999999);if(n<1)n=1;print a[n]}' "$tmp")"
+            jit=$((max-min))
+        fi
+        rm -f "$tmp"
+        score="$(score_calc "$ok" "$QUALITY_RUNS" "$med" "$p95" "$p99" "$jit" "$cert" "$pq" "$same" "$ready")"
+    else
+        a=""; aas="ASUNKNOWN"; p=UNKNOWN
+    fi
+
+    {
+        flock 9
+        printf '%04d|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+            "$score" "$d" "${ip:-DNS_FAIL}" "$aas" "$p" "$same" "$pq" "$cert" "$ready" \
+            "$ok" "$QUALITY_RUNS" "$med" "$p95" "$p99" "$avg" "$jit" "$max" "$tls13" "$h2" "$verify" "$xraysni" >> "$BENCH"
+        printf 'CUSTOM      %-32s score=%4s ready=%s success=%s/%s med=%sms p95=%sms p99=%sms provider=%s\n' \
+            "$d" "$score" "$ready" "$ok" "$QUALITY_RUNS" "$med" "$p95" "$p99" "$p" >> "$REP"
+    } 9>"$LOCK_BENCH"
+}
+
+write_custom_ranked() {
+    {
+        printf '%-5s %-32s %-6s %-9s %-8s %-8s %-8s %-8s %-6s %-12s %-8s\n' SCORE DOMAIN READY SUCCESS MEDIAN P95 P99 JITTER CERT PROVIDER PQ
+        printf '%-5s %-32s %-6s %-9s %-8s %-8s %-8s %-8s %-6s %-12s %-8s\n' ----- -------------------------------- ------ --------- -------- -------- -------- -------- ------ ------------ --------
+        sort -t'|' -k1,1nr -k12,12n -k13,13n "$BENCH" |
+            awk -F'|' '{printf "%5d %-32s %-6s %3s/%-5s %5sms %5sms %5sms %5sms %6s %-12s %-8s\n",$1+0,$2,$9,$10,$11,$12,$13,$14,$16,$8,$5,$7}'
+    } > "$RANKED.tmp"
+    mv -f "$RANKED.tmp" "$RANKED"
+
+    {
+        echo 'score,domain,ip,asn,provider,same_asn,pq,cert_bytes,reality_ready,success,runs,median_ms,p95_ms,p99_ms,avg_ms,jitter_ms,max_ms,tls13,http2,cert_verify,xray_sni'
+        sort -t'|' -k1,1nr -k12,12n -k13,13n "$BENCH" |
+            awk -F'|' 'BEGIN{OFS=","}{print $1+0,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21}'
+    } > "$CSVOUT.tmp"
+    mv -f "$CSVOUT.tmp" "$CSVOUT"
+}
+
+# ----------------------- random discovery mode -----------------------
 fast_probe() {
-    local d="$1" ip a p tls
+    local d="$1" ip a an p tls
     ip="$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u | head -1)"
     [ -n "$ip" ] || return 0
 
     a="$(asn "$ip")"; [[ "$a" =~ ^[0-9]+$ ]] || return 0
-    p="$(provider_from_asn "$a")"
+    p="$(provider_name "$a" "")"
     [ "$p" != CLOUDFLARE ] || return 0
     [ "$p" != FASTLY ] || return 0
     [ "$p" != GOOGLE ] || return 0
@@ -350,27 +525,18 @@ fast_probe() {
     tls="$(timeout 4 openssl s_client -connect "$ip:443" -servername "$d" -alpn h2 -tls1_3 -verify_return_error </dev/null 2>&1)"
     grep -Eqi 'TLSv1\.3|Protocol *: TLSv1\.3' <<< "$tls" || return 0
     grep -Eqi 'ALPN protocol: h2' <<< "$tls" || return 0
-    grep -Eqi 'Verify return code: 0 \(ok\)' <<< "$tls" || return 0
+    grep -Eqi 'Verify return code: 0 \(ok\)|Verification: OK' <<< "$tls" || return 0
 
     { flock 9; printf '%s|%s|%s|%s\n' "$d" "$ip" "$a" "$p" >> "$PRE"; } 9>"$LOCK_PRE"
 }
 
-# Stage 2: expensive REALITY checks only for fast-pass candidates.
 strict_probe() {
     local line="$1" d ip a p an tls cert xo rc sni pq=UNKNOWN pqrank=1 i t ms pass=0 med same=NO samerank=1
     local times=()
     IFS='|' read -r d ip a p <<< "$line"
 
-    # Re-check provider from authoritative AS name here. This catches
-    # alternate Cloudflare/Fastly/Google ASNs without slowing the 1M prefilter.
     an="$(asname "$a")"
-    if grep -Eqi 'cloudflare' <<< "$an"; then
-        p=CLOUDFLARE
-    elif grep -Eqi 'fastly' <<< "$an"; then
-        p=FASTLY
-    elif grep -Eqi 'google' <<< "$an"; then
-        p=GOOGLE
-    fi
+    p="$(provider_name "$a" "$an")"
     [ "$p" != CLOUDFLARE ] || return 0
     [ "$p" != FASTLY ] || return 0
     [ "$p" != GOOGLE ] || return 0
@@ -378,7 +544,7 @@ strict_probe() {
     tls="$(timeout 7 openssl s_client -showcerts -connect "$ip:443" -servername "$d" -alpn h2 -tls1_3 -verify_return_error </dev/null 2>&1)"
     grep -Eqi 'TLSv1\.3|Protocol *: TLSv1\.3' <<< "$tls" || return 0
     grep -Eqi 'ALPN protocol: h2' <<< "$tls" || return 0
-    grep -Eqi 'Verify return code: 0 \(ok\)' <<< "$tls" || return 0
+    grep -Eqi 'Verify return code: 0 \(ok\)|Verification: OK' <<< "$tls" || return 0
 
     cert="$(certlen_from_tlsout "$tls" || true)"
     [[ "$cert" =~ ^[0-9]+$ ]] || return 0
@@ -413,26 +579,8 @@ strict_probe() {
     } 9>"$LOCK_STRICT"
 }
 
-score_calc() {
-    local success="$1" runs="$2" med="$3" p95="$4" jit="$5" cert="$6" pq="$7" same="$8"
-    awk -v ok="$success" -v n="$runs" -v med="$med" -v p95="$p95" -v jit="$jit" -v cert="$cert" -v pq="$pq" -v same="$same" '
-        BEGIN {
-            rel = (n>0 ? (ok/n)*400 : 0)
-            lm = 220 - med*1.20; if(lm>200)lm=200; if(lm<0)lm=0
-            lp = 220 - p95; if(lp>200)lp=200; if(lp<0)lp=0
-            j = 110 - jit*1.50; if(j>100)j=100; if(j<0)j=0
-            c = (cert>=6500 ? 40 : (cert>=5000 ? 34 : (cert>=4000 ? 27 : 20)))
-            q = (pq=="YES" ? 30 : (pq=="UNKNOWN" ? 15 : 0))
-            s = (same=="YES" ? 30 : 0)
-            total = int(rel+lm+lp+j+c+q+s+0.5)
-            if(total<1)total=1; if(total>1000)total=1000
-            print total
-        }'
-}
-
 benchmark_one() {
-    local line="$1" samerank pqrank d ip aas p cert strictmed pq same i rc t ok=0 ms med avg p95 min max jit score
-    local tmp
+    local line="$1" samerank pqrank d ip aas p cert strictmed pq same i rc t ok=0 ms med avg p95 p99 min max jit score tmp
     IFS='|' read -r samerank pqrank d ip aas p cert strictmed pq same <<< "$line"
     tmp="$(mktemp "$W/times.XXXXXX")" || return 0
 
@@ -449,37 +597,38 @@ benchmark_one() {
     avg="$(awk '{s+=$1}END{if(NR)printf "%.0f",s/NR}' "$tmp")"
     med="$(awk '{a[NR]=$1}END{if(NR%2)printf "%.0f",a[(NR+1)/2];else printf "%.0f",(a[NR/2]+a[NR/2+1])/2}' "$tmp")"
     p95="$(awk '{a[NR]=$1}END{n=int(NR*.95+.999999);if(n<1)n=1;print a[n]}' "$tmp")"
+    p99="$(awk '{a[NR]=$1}END{n=int(NR*.99+.999999);if(n<1)n=1;print a[n]}' "$tmp")"
     jit=$((max-min))
-    score="$(score_calc "$ok" "$QUALITY_RUNS" "$med" "$p95" "$jit" "$cert" "$pq" "$same")"
+    score="$(score_calc "$ok" "$QUALITY_RUNS" "$med" "$p95" "$p99" "$jit" "$cert" "$pq" "$same" YES)"
     rm -f "$tmp"
 
     {
         flock 9
-        printf '%04d|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-            "$score" "$d" "$ip" "$aas" "$p" "$same" "$pq" "$cert" "$ok" "$QUALITY_RUNS" "$med" "$p95" "$avg" "$jit" "$max" >> "$BENCH"
-        printf 'BENCH       %-32s score=%4s success=%s/%s med=%sms p95=%sms jitter=%sms\n' "$d" "$score" "$ok" "$QUALITY_RUNS" "$med" "$p95" "$jit" >> "$REP"
+        printf '%04d|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+            "$score" "$d" "$ip" "$aas" "$p" "$same" "$pq" "$cert" "$ok" "$QUALITY_RUNS" "$med" "$p95" "$p99" "$avg" "$jit" "$max" >> "$BENCH"
+        printf 'BENCH       %-32s score=%4s success=%s/%s med=%sms p95=%sms p99=%sms jitter=%sms\n' "$d" "$score" "$ok" "$QUALITY_RUNS" "$med" "$p95" "$p99" "$jit" >> "$REP"
     } 9>"$LOCK_BENCH"
 }
 
-write_ranked() {
+write_random_ranked() {
     {
-        printf '%-5s %-32s %-9s %-8s %-8s %-8s %-6s %-8s %-8s %-11s\n' SCORE DOMAIN SUCCESS MEDIAN P95 JITTER CERT PQ SAME_ASN PROVIDER
-        printf '%-5s %-32s %-9s %-8s %-8s %-8s %-6s %-8s %-8s %-11s\n' ----- -------------------------------- --------- -------- -------- -------- ------ -------- -------- -----------
+        printf '%-5s %-32s %-9s %-8s %-8s %-8s %-8s %-6s %-8s %-8s %-11s\n' SCORE DOMAIN SUCCESS MEDIAN P95 P99 JITTER CERT PQ SAME_ASN PROVIDER
+        printf '%-5s %-32s %-9s %-8s %-8s %-8s %-8s %-6s %-8s %-8s %-11s\n' ----- -------------------------------- --------- -------- -------- -------- -------- ------ -------- -------- -----------
         awk -F'|' '$9==$10' "$BENCH" | sort -t'|' -k1,1nr -k11,11n -k12,12n |
             head -n "$N" |
-            awk -F'|' '{printf "%5d %-32s %2s/%-6s %5sms %5sms %5sms %6s %-8s %-8s %-11s\n",$1+0,$2,$9,$10,$11,$12,$14,$8,$7,$6,$5}'
+            awk -F'|' '{printf "%5d %-32s %2s/%-6s %5sms %5sms %5sms %5sms %6s %-8s %-8s %-11s\n",$1+0,$2,$9,$10,$11,$12,$13,$15,$8,$7,$6,$5}'
     } > "$RANKED.tmp"
     mv -f "$RANKED.tmp" "$RANKED"
 
     {
-        echo 'score,domain,ip,asn,provider,same_asn,pq,cert_bytes,success,runs,median_ms,p95_ms,avg_ms,jitter_ms,max_ms'
+        echo 'score,domain,ip,asn,provider,same_asn,pq,cert_bytes,success,runs,median_ms,p95_ms,p99_ms,avg_ms,jitter_ms,max_ms'
         awk -F'|' '$9==$10' "$BENCH" | sort -t'|' -k1,1nr -k11,11n -k12,12n | head -n "$N" |
-            awk -F'|' 'BEGIN{OFS=","}{print $1+0,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15}'
+            awk -F'|' 'BEGIN{OFS=","}{print $1+0,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16}'
     } > "$CSVOUT.tmp"
     mv -f "$CSVOUT.tmp" "$CSVOUT"
 }
 
-export -f asn asname provider_from_asn median certlen_from_tlsout fast_probe xping strict_probe score_calc benchmark_one
+export -f asn asname provider_name median certlen_from_tlsout score_calc custom_test_one fast_probe xping strict_probe benchmark_one
 export CID XPATH W PRE STRICT BENCH REP LOCK_PRE LOCK_STRICT LOCK_BENCH MIN_CERT_LENGTH MAX_MEDIAN_MS STRICT_TESTS QUALITY_RUNS SASN
 
 SIP="$(curl -4 -fsS --connect-timeout 4 --max-time 8 https://api.ipify.org 2>/dev/null || true)"
@@ -487,7 +636,42 @@ SASN=""; [ -n "$SIP" ] && SASN="$(asn "$SIP")"
 export SASN
 log "Server      : ${SIP:-UNKNOWN} ${SASN:+AS$SASN}"
 
-progress "SETUP" 0 0 0 0 0 0 "Preparing randomized source"
+if [ "$MODE" = custom ]; then
+    CANDS="$W/custom-domains.txt"
+    printf '%s\n' "$CUSTOM_DOMAINS" | tr ',' '\n' | awk 'NF{print tolower($0)}' > "$CANDS"
+    TOTAL="$(wc -l < "$CANDS")"
+    [ "$TOTAL" -gt 0 ] || { log "[!] Custom domain list is empty."; exit 1; }
+
+    progress "BENCHMARK" 0 "$TOTAL" 0 0 0 0 "Testing exactly the supplied domains; providers are not excluded"
+    log
+    log "[CUSTOM] Testing $TOTAL supplied domains x $QUALITY_RUNS fresh TLS connections..."
+    xargs -r -d '\n' -P "$QUALITY_WORKERS" -I '{}' bash -c 'custom_test_one "$1"' _ '{}' < "$CANDS"
+
+    BENCH_COUNT="$(wc -l < "$BENCH")"
+    PERFECT="$(awk -F'|' '$10==$11{n++}END{print n+0}' "$BENCH")"
+    write_custom_ranked
+    progress "DONE" "$TOTAL" "$TOTAL" "$TOTAL" "$BENCH_COUNT" "$BENCH_COUNT" "$PERFECT" "All supplied domains ranked; no provider exclusion in custom mode"
+
+    cp -f "$RANKED" /root/reality-ranked.txt 2>/dev/null || true
+    cp -f "$CSVOUT" /root/reality-ranked.csv 2>/dev/null || true
+
+    log
+    log "============================================================"
+    log " FINAL - CUSTOM DOMAINS"
+    log "============================================================"
+    log "Targets      : $TOTAL"
+    log "Tests/target : $QUALITY_RUNS"
+    log "Benchmarked  : $BENCH_COUNT"
+    log "Perfect      : $PERFECT/$TOTAL"
+    log "Ranked       : $RANKED"
+    log "CSV          : $CSVOUT"
+    log "============================================================"
+    cat "$RANKED"
+    exit 0
+fi
+
+# Random discovery source
+progress "SETUP" 0 0 0 0 0 0 "Preparing randomized Tranco source"
 ZIP="$W/tranco.zip"; CSV="$W/tranco.csv"; CANDS="$W/candidates.txt"
 log
 log "[1/3] Preparing randomized candidate list..."
@@ -495,8 +679,7 @@ curl -fsSL --connect-timeout 10 --max-time 120 https://tranco-list.eu/top-1m.csv
 unzip -t "$ZIP" >/dev/null 2>&1 || { log "[!] Invalid Tranco archive."; exit 1; }
 unzip -p "$ZIP" | tr -d '\r' > "$CSV"
 
-# Tranco is already rank-oriented; avoid an unnecessary sort -u over ~1M rows.
-awk -F',' 'NF>=2{d=tolower($2);gsub(/^[[:space:]"]+|[[:space:]"]+$/,"",d);print d}' "$CSV" |
+awk -F',' 'NF>=2{d=tolower($2);gsub(/^[[:space:]\"]+|[[:space:]\"]+$/,"",d);print d}' "$CSV" |
     grep -E '^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$' |
     grep -Evi '(^|\.)apple\.com$|(^|\.)icloud\.com$|(^|\.)google\.|(^|\.)googleapis\.com$|(^|\.)googleusercontent\.com$|(^|\.)gstatic\.com$|(^|\.)youtube\.com$|(^|\.)youtu\.be$|(^|\.)doubleclick\.net$' |
     shuf | head -n "$MAXC" > "$CANDS"
@@ -517,7 +700,7 @@ ROUND=1
 
 while [ "$PERFECT" -lt "$N" ] && [ "$OFFSET" -le "$TOTAL" ]; do
     STRICT_COUNT="$(wc -l < "$STRICT")"
-    log "      round=$ROUND  strict_goal=$STRICT_GOAL  perfect=$PERFECT/$N"
+    log "      round=$ROUND strict_goal=$STRICT_GOAL perfect=$PERFECT/$N"
 
     while [ "$OFFSET" -le "$TOTAL" ] && [ "$STRICT_COUNT" -lt "$STRICT_GOAL" ]; do
         END=$((OFFSET + PREFILTER_BATCH - 1)); [ "$END" -gt "$TOTAL" ] && END="$TOTAL"
@@ -537,7 +720,7 @@ while [ "$PERFECT" -lt "$N" ] && [ "$OFFSET" -le "$TOTAL" ]; do
         fi
 
         STRICT_COUNT="$(wc -l < "$STRICT")"
-        log "      scanned=$END/$TOTAL  prefilter=$PRE_NOW  strict=$STRICT_COUNT/$STRICT_GOAL"
+        log "      scanned=$END/$TOTAL prefilter=$PRE_NOW strict=$STRICT_COUNT/$STRICT_GOAL"
         progress "SCAN" "$END" "$TOTAL" "$PRE_NOW" "$STRICT_COUNT" "$BENCHED_STRICT" "$PERFECT" "Next fast batch"
         OFFSET=$((END + 1))
     done
@@ -556,9 +739,9 @@ while [ "$PERFECT" -lt "$N" ] && [ "$OFFSET" -le "$TOTAL" ]; do
         BENCHED_STRICT="$STRICT_COUNT"
         BENCH_COUNT="$(wc -l < "$BENCH")"
         PERFECT="$(awk -F'|' '$9==$10{n++}END{print n+0}' "$BENCH")"
-        write_ranked
+        write_random_ranked
         progress "QUALITY" "$((OFFSET-1))" "$TOTAL" "$(wc -l < "$PRE")" "$STRICT_COUNT" "$BENCH_COUNT" "$PERFECT" "Perfect $QUALITY_RUNS/$QUALITY_RUNS targets: $PERFECT/$N"
-        log "      benchmarked=$BENCH_COUNT  perfect=$PERFECT/$N"
+        log "      benchmarked=$BENCH_COUNT perfect=$PERFECT/$N"
     fi
 
     [ "$PERFECT" -ge "$N" ] && break
@@ -571,7 +754,7 @@ done
 STRICT_COUNT="$(wc -l < "$STRICT")"
 BENCH_COUNT="$(wc -l < "$BENCH")"
 PERFECT="$(awk -F'|' '$9==$10{n++}END{print n+0}' "$BENCH")"
-write_ranked
+write_random_ranked
 progress "DONE" "$((OFFSET-1))" "$TOTAL" "$(wc -l < "$PRE")" "$STRICT_COUNT" "$BENCH_COUNT" "$PERFECT" "Ranked by score 1..1000"
 
 cp -f "$RANKED" /root/reality-ranked.txt 2>/dev/null || true
