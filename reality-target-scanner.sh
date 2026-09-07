@@ -1,23 +1,18 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# Strict REALITY target scanner for Marzban/Xray in Docker.
-# Interactive launches detach with nohup so scans survive SSH disconnects.
-# Worker mode randomly samples public domains and stops after the requested
-# number of targets pass REALITY-oriented TLS, PQ, certificate-size and
-# stability checks.
-
 BASE_DIR="${BASE_DIR:-/root/reality-scans}"
 GLOBAL_PID_FILE="${GLOBAL_PID_FILE:-/run/reality-scan.pid}"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 
 show_status() {
-    local latest="$BASE_DIR/latest" pid=""
+    local latest="$BASE_DIR/latest" pid="" running=0
     if [ -f "$GLOBAL_PID_FILE" ]; then
         pid="$(cat "$GLOBAL_PID_FILE" 2>/dev/null || true)"
     fi
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         echo "RUNNING pid=$pid"
+        running=1
     else
         echo "NOT RUNNING"
     fi
@@ -25,28 +20,28 @@ show_status() {
         echo "Latest run : $(readlink -f "$latest" 2>/dev/null || echo "$latest")"
         [ -f "$latest/reality-scan.log" ] && echo "Log        : $latest/reality-scan.log"
         [ -f "$latest/reality-healthy.txt" ] && echo "Healthy    : $latest/reality-healthy.txt"
+        if [ "$running" -eq 0 ] && [ -f "$latest/reality-scan.log" ]; then
+            echo
+            echo "Last log lines:"
+            tail -n 8 "$latest/reality-scan.log" 2>/dev/null || true
+        fi
     fi
 }
 
 case "${1:-}" in
-    status)
-        show_status
-        exit 0
-        ;;
+    status) show_status; exit 0 ;;
     log|logs)
         if [ -f "$BASE_DIR/latest/reality-scan.log" ]; then
             tail -f "$BASE_DIR/latest/reality-scan.log"
         else
-            echo "No scan log found yet."
-            exit 1
+            echo "No scan log found yet."; exit 1
         fi
         ;;
     results|result)
         if [ -f "$BASE_DIR/latest/reality-healthy.txt" ]; then
             cat "$BASE_DIR/latest/reality-healthy.txt"
         else
-            echo "No healthy-target file found yet."
-            exit 1
+            echo "No healthy-target file found yet."; exit 1
         fi
         ;;
     stop)
@@ -63,8 +58,6 @@ case "${1:-}" in
         ;;
 esac
 
-# Interactive launcher. Ask how many healthy targets are wanted, then launch
-# the real worker detached from the SSH session.
 if [ "${REALITY_SCAN_WORKER:-0}" != "1" ]; then
     mkdir -p "$BASE_DIR"
 
@@ -87,9 +80,7 @@ if [ "${REALITY_SCAN_WORKER:-0}" != "1" ]; then
             printf 'How many healthy REALITY targets do you want? [%s]: ' "$default_needed"
             IFS= read -r wanted
             wanted="${wanted:-$default_needed}"
-            if [[ "$wanted" =~ ^[1-9][0-9]*$ ]]; then
-                break
-            fi
+            [[ "$wanted" =~ ^[1-9][0-9]*$ ]] && break
             echo "Please enter a positive integer."
         done
     else
@@ -136,15 +127,13 @@ fi
 
 NEEDED="${NEEDED:-50}"
 POOL_SIZE="${POOL_SIZE:-1000000}"
-BATCH_SIZE="${BATCH_SIZE:-500}"
+BATCH_SIZE="${BATCH_SIZE:-300}"
 WORKERS="${WORKERS:-8}"
 STABILITY_TESTS="${STABILITY_TESTS:-3}"
 MAX_MEDIAN_MS="${MAX_MEDIAN_MS:-1000}"
 MIN_CERT_LENGTH="${MIN_CERT_LENGTH:-3500}"
-REQUIRE_PQ="${REQUIRE_PQ:-1}"
 EXCLUDE_CLOUDFLARE="${EXCLUDE_CLOUDFLARE:-1}"
 EXCLUDE_FASTLY="${EXCLUDE_FASTLY:-1}"
-MIN_XRAY_VERSION="${MIN_XRAY_VERSION:-25.7.26}"
 MAX_CANDIDATES="${MAX_CANDIDATES:-1000000}"
 
 OUT_DIR="${OUT_DIR:-/root/reality-scans/manual-$(date +%Y%m%d-%H%M%S)}"
@@ -178,23 +167,14 @@ version_ge() {
     [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
 }
 
-install_deps_if_needed() {
-    local missing=()
-    local c
-    for c in docker curl unzip awk grep shuf dig openssl timeout getent sort sed flock; do
+check_deps() {
+    local missing=() c
+    for c in docker curl unzip awk grep shuf dig openssl timeout getent sort sed flock wc mktemp; do
         command -v "$c" >/dev/null 2>&1 || missing+=("$c")
     done
-    if ((${#missing[@]} == 0)); then return 0; fi
-
-    log "[!] Missing commands: ${missing[*]}"
-    if [ "$(id -u)" -eq 0 ] && command -v apt-get >/dev/null 2>&1; then
-        log "[+] Installing dependencies..."
-        apt-get update -qq || return 1
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            docker.io curl unzip dnsutils openssl coreutils util-linux >/dev/null || return 1
-    else
-        log "[!] Install dependencies manually (Debian/Ubuntu):"
-        log "    apt update && apt install -y docker.io curl unzip dnsutils openssl coreutils util-linux"
+    if ((${#missing[@]})); then
+        log "[!] Missing commands: ${missing[*]}"
+        log "    Debian/Ubuntu: apt update && apt install -y curl unzip dnsutils openssl coreutils util-linux"
         return 1
     fi
 }
@@ -213,13 +193,8 @@ find_xray_container() {
         ver="$(sed -nE 's/^Xray[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' <<<"$line")"
         [ -n "$ver" ] || continue
         printf '    found: %-24s %-34s Xray %s\n' "$name" "$image" "$ver" >&2
-
         if [ -z "$best_ver" ] || version_ge "$ver" "$best_ver"; then
-            best_ver="$ver"
-            best_cid="$cid"
-            best_name="$name"
-            best_image="$image"
-            best_path="$path"
+            best_ver="$ver"; best_cid="$cid"; best_name="$name"; best_image="$image"; best_path="$path"
         fi
     done <<< "$rows"
 
@@ -257,8 +232,28 @@ median_ms() {
     printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END {if (NR%2) print a[(NR+1)/2]; else printf "%.0f\n", (a[NR/2]+a[NR/2+1])/2}'
 }
 
+cert_chain_length() {
+    local d="$1" td f bytes total=0 count=0
+    td="$(mktemp -d "$WORK/cert.XXXXXX")" || return 1
+    timeout 8 openssl s_client -showcerts -connect "$d:443" -servername "$d" </dev/null 2>/dev/null |
+        awk -v dir="$td" '
+            /-----BEGIN CERTIFICATE-----/ {n++; file=sprintf("%s/cert-%03d.pem",dir,n); inside=1}
+            inside {print > file}
+            /-----END CERTIFICATE-----/ {close(file); inside=0}
+        '
+    for f in "$td"/cert-*.pem; do
+        [ -e "$f" ] || continue
+        bytes="$(openssl x509 -in "$f" -outform DER 2>/dev/null | wc -c | tr -d ' ')"
+        [[ "$bytes" =~ ^[0-9]+$ ]] || continue
+        total=$((total + bytes)); count=$((count + 1))
+    done
+    rm -rf "$td"
+    [ "$count" -gt 0 ] || return 1
+    printf '%s\n' "$total"
+}
+
 probe_domain() {
-    local D="$1" ip asn asname cname provider tlsout xout sni certlen pq pass=0 res rc ms median same_asn same_rank
+    local D="$1" ip asn asname cname provider tlsout xout certlen pq pq_rank pass=0 res rc ms median same_asn same_rank
     local times=()
 
     ip="$(getent ahostsv4 "$D" 2>/dev/null | awk '{print $1}' | sort -u | head -n1)"
@@ -270,11 +265,11 @@ probe_domain() {
     cname="$(dig +short CNAME "$D" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
     provider="$(provider_name "$asn" "$cname" "$asname")"
 
-    [ "$EXCLUDE_CLOUDFLARE" -eq 0 ] || [ "$provider" != "CLOUDFLARE" ] || return 0
-    [ "$EXCLUDE_FASTLY" -eq 0 ] || [ "$provider" != "FASTLY" ] || return 0
-    [ "$provider" != "GOOGLE" ] || return 0
+    [ "$EXCLUDE_CLOUDFLARE" -eq 0 ] || [ "$provider" != CLOUDFLARE ] || return 0
+    [ "$EXCLUDE_FASTLY" -eq 0 ] || [ "$provider" != FASTLY ] || return 0
+    [ "$provider" != GOOGLE ] || return 0
 
-    tlsout="$(timeout 6 openssl s_client -connect "$D:443" -servername "$D" -alpn h2 -tls1_3 </dev/null 2>&1)"
+    tlsout="$(timeout 7 openssl s_client -connect "$D:443" -servername "$D" -alpn h2 -tls1_3 </dev/null 2>&1)"
     grep -Eqi 'TLSv1\.3|Protocol *: TLSv1\.3' <<<"$tlsout" || return 0
     grep -Eqi 'ALPN protocol: h2' <<<"$tlsout" || return 0
     grep -Eqi 'Verify return code: 0 \(ok\)' <<<"$tlsout" || return 0
@@ -282,42 +277,46 @@ probe_domain() {
     xout="$(timeout 12 docker exec "$XRAY_CID" "$XRAY_PATH" tls ping "$D:443" 2>&1)"
     rc=$?
     [ "$rc" -eq 0 ] || return 0
-    grep -q 'TLS ping finished' <<<"$xout" || return 0
+    grep -q 'Handshake succeeded' <<<"$xout" || return 0
+    grep -Eq 'TLS Version:[[:space:]]+TLS 1\.3' <<<"$xout" || return 0
 
-    sni="$(awk '/Pinging with SNI/{f=1; next} f{print}' <<<"$xout")"
-    grep -q 'Handshake succeeded' <<<"$sni" || return 0
-    grep -Eq 'TLS Version:[[:space:]]+TLS 1\.3' <<<"$sni" || return 0
-
-    certlen="$(grep -Eo "Certificate chain's total length:[[:space:]]*[0-9]+" <<<"$sni" | head -n1 | grep -Eo '[0-9]+$')"
+    certlen="$(grep -Eo "Certificate chain's total length:[[:space:]]*[0-9]+" <<<"$xout" | head -n1 | grep -Eo '[0-9]+$' || true)"
+    if ! [[ "$certlen" =~ ^[0-9]+$ ]]; then
+        certlen="$(cert_chain_length "$D" || true)"
+    fi
     [[ "$certlen" =~ ^[0-9]+$ ]] || return 0
     [ "$certlen" -gt "$MIN_CERT_LENGTH" ] || return 0
 
-    pq=NO
-    if grep -Eqi 'TLS Post-Quantum key exchange:[[:space:]]+true.*X25519MLKEM768' <<<"$sni"; then pq=YES; fi
-    [ "$REQUIRE_PQ" -eq 0 ] || [ "$pq" = YES ] || return 0
+    pq=UNKNOWN; pq_rank=1
+    if grep -q 'TLS Post-Quantum key exchange:' <<<"$xout"; then
+        if grep -Eqi 'TLS Post-Quantum key exchange:[[:space:]]+true.*X25519MLKEM768' <<<"$xout"; then
+            pq=YES; pq_rank=0
+        else
+            pq=NO; pq_rank=2
+        fi
+    fi
 
     for ((i=1; i<=STABILITY_TESTS; i++)); do
         res="$(curl -4 -sS -o /dev/null --connect-timeout 3 --max-time 7 -H 'Connection: close' -w '%{time_appconnect}' "https://$D/" 2>/dev/null)"
         rc=$?
         if [ "$rc" -eq 0 ] && [ -n "$res" ] && [ "$res" != "0.000000" ]; then
             ms="$(awk -v x="$res" 'BEGIN {printf "%.0f", x*1000}')"
-            times+=("$ms")
-            pass=$((pass+1))
+            times+=("$ms"); pass=$((pass + 1))
         fi
     done
     [ "$pass" -eq "$STABILITY_TESTS" ] || return 0
 
     median="$(median_ms "${times[@]}")"
+    [[ "$median" =~ ^[0-9]+$ ]] || return 0
     [ "$median" -le "$MAX_MEDIAN_MS" ] || return 0
 
-    same_asn=NO
-    if [ -n "$SERVER_ASN" ] && [ "$asn" = "$SERVER_ASN" ]; then same_asn=YES; fi
-    same_rank=1; [ "$same_asn" = YES ] && same_rank=0
+    same_asn=NO; same_rank=1
+    if [ -n "$SERVER_ASN" ] && [ "$asn" = "$SERVER_ASN" ]; then same_asn=YES; same_rank=0; fi
 
     {
         flock 9
-        printf '%d|%06d|%s|%s|AS%s|%s|%s|%s|%s\n' \
-            "$same_rank" "$median" "$D" "$ip" "$asn" "$provider" "$same_asn" "$pq" "$certlen" >> "$GOOD_RAW"
+        printf '%d|%d|%06d|%s|%s|AS%s|%s|%s|%s|%s\n' \
+            "$same_rank" "$pq_rank" "$median" "$D" "$ip" "$asn" "$provider" "$same_asn" "$pq" "$certlen" >> "$GOOD_RAW"
         {
             echo "DOMAIN      : $D"
             echo "IP          : $ip"
@@ -339,12 +338,11 @@ probe_domain() {
     } 9>"$LOCK"
 }
 
-export -f get_asn get_asname provider_name median_ms probe_domain
+export -f get_asn get_asname provider_name median_ms cert_chain_length probe_domain
 
-install_deps_if_needed || exit 1
-
+check_deps || exit 1
 if ! docker info >/dev/null 2>&1; then
-    log "[!] Docker is not available or this user cannot access the Docker daemon."
+    log "[!] Docker is unavailable or this user cannot access the Docker daemon."
     exit 1
 fi
 
@@ -362,16 +360,27 @@ log "    ID      : $XRAY_CID"
 log "    Binary  : $XRAY_PATH"
 log "    Version : $XRAY_VERSION"
 
-if ! version_ge "$XRAY_VERSION" "$MIN_XRAY_VERSION"; then
-    log "[!] Xray $XRAY_VERSION is too old for this strict scanner."
-    log "    Required: >= $MIN_XRAY_VERSION"
+CAPOUT="$(timeout 15 docker exec "$XRAY_CID" "$XRAY_PATH" tls ping github.io:443 2>&1)"
+CAPRC=$?
+if [ "$CAPRC" -ne 0 ] || ! grep -q 'Handshake succeeded' <<<"$CAPOUT"; then
+    log "[!] This Xray binary cannot perform a usable 'tls ping' handshake."
+    log "    Version detected: $XRAY_VERSION"
     exit 1
 fi
 
-if ! docker exec "$XRAY_CID" "$XRAY_PATH" tls ping github.io:443 >/dev/null 2>&1; then
-    log "[!] The selected Xray core does not pass a tls ping capability test."
-    exit 1
+if grep -q "Certificate chain's total length:" <<<"$CAPOUT"; then
+    CERT_MODE="XRAY_NATIVE"
+else
+    CERT_MODE="OPENSSL_COMPAT"
 fi
+if grep -q 'TLS Post-Quantum key exchange:' <<<"$CAPOUT"; then
+    PQ_MODE="XRAY_NATIVE"
+else
+    PQ_MODE="UNAVAILABLE_ON_THIS_CORE"
+fi
+log "    tls ping : supported"
+log "    Cert size: $CERT_MODE"
+log "    PQ report: $PQ_MODE"
 
 SERVER_IP="$(curl -4 -fsS --connect-timeout 4 --max-time 8 https://api.ipify.org 2>/dev/null || true)"
 SERVER_ASN=""; SERVER_ASNAME=""
@@ -379,16 +388,13 @@ if [ -n "$SERVER_IP" ]; then
     SERVER_ASN="$(get_asn "$SERVER_IP")"
     SERVER_ASNAME="$(get_asname "$SERVER_ASN")"
 fi
+log "    Server   : ${SERVER_IP:-UNKNOWN} ${SERVER_ASN:+AS$SERVER_ASN} ${SERVER_ASNAME:-}"
 
-log "    Server IP/ASN: ${SERVER_IP:-UNKNOWN} ${SERVER_ASN:+AS$SERVER_ASN} ${SERVER_ASNAME:-}"
 log
 log "[+] Downloading randomized public-domain source..."
-
-curl -fsSL --connect-timeout 10 --max-time 120 \
-    'https://tranco-list.eu/top-1m.csv.zip' -o "$ZIP" || {
-        log "[!] Failed to download Tranco Top 1M."
-        exit 1
-    }
+curl -fsSL --connect-timeout 10 --max-time 120 'https://tranco-list.eu/top-1m.csv.zip' -o "$ZIP" || {
+    log "[!] Failed to download Tranco Top 1M."; exit 1
+}
 unzip -t "$ZIP" >/dev/null 2>&1 || { log "[!] Invalid Tranco ZIP."; exit 1; }
 unzip -p "$ZIP" | tr -d '\r' > "$RAW"
 
@@ -402,52 +408,51 @@ TOTAL_CANDS="$(wc -l < "$CANDS")"
 [ "$TOTAL_CANDS" -gt 0 ] || { log "[!] Candidate generation returned 0 domains."; exit 1; }
 
 export XRAY_CID XRAY_NAME XRAY_IMAGE XRAY_PATH XRAY_VERSION SERVER_ASN \
-    EXCLUDE_CLOUDFLARE EXCLUDE_FASTLY REQUIRE_PQ MIN_CERT_LENGTH \
-    STABILITY_TESTS MAX_MEDIAN_MS GOOD_RAW OUT LOCK
+    EXCLUDE_CLOUDFLARE EXCLUDE_FASTLY MIN_CERT_LENGTH STABILITY_TESTS \
+    MAX_MEDIAN_MS GOOD_RAW OUT LOCK WORK
 
 log "[+] Candidates ready: $TOTAL_CANDS"
-log "[+] Need at least $NEEDED strict REALITY targets. Scanning in random batches..."
+log "[+] Need $NEEDED strict REALITY-compatible targets."
+log "[+] Cloudflare/Fastly/Google excluded; same-ASN and PQ are ranking bonuses."
 log
 
 OFFSET=1
 while [ "$OFFSET" -le "$TOTAL_CANDS" ]; do
-    FOUND="$(wc -l < "$GOOD_RAW")"
-    [ "$FOUND" -ge "$NEEDED" ] && break
+    FOUND_ALL="$(wc -l < "$GOOD_RAW")"
+    [ "$FOUND_ALL" -ge "$NEEDED" ] && break
 
     END=$((OFFSET + BATCH_SIZE - 1))
     [ "$END" -gt "$TOTAL_CANDS" ] && END="$TOTAL_CANDS"
-    log "[*] Batch $OFFSET-$END | healthy so far: $FOUND/$NEEDED"
-
+    log "[*] Batch $OFFSET-$END | healthy so far: $FOUND_ALL/$NEEDED"
     sed -n "${OFFSET},${END}p" "$CANDS" | xargs -r -P "$WORKERS" -n 1 bash -c 'probe_domain "$1"' _
     OFFSET=$((END + 1))
 done
 
-FOUND="$(wc -l < "$GOOD_RAW")"
-
+FOUND_ALL="$(wc -l < "$GOOD_RAW")"
 if [ -s "$GOOD_RAW" ]; then
-    sort -t'|' -k1,1n -k2,2n "$GOOD_RAW" |
-        awk -F'|' '{printf "%-32s IP=%-15s %-10s PROVIDER=%-11s SAME_ASN=%-3s PQ=%-3s CERT=%-5s LAT=%dms\n", $3,$4,$5,$6,$7,$8,$9,$2+0}' |
+    sort -t'|' -k1,1n -k2,2n -k3,3n "$GOOD_RAW" | head -n "$NEEDED" |
+        awk -F'|' '{printf "%-32s IP=%-15s %-10s PROVIDER=%-11s SAME_ASN=%-3s PQ=%-7s CERT=%-5s LAT=%dms\n", $4,$5,$6,$7,$8,$9,$10,$3+0}' |
         tee "$HEALTHY"
 else
     : > "$HEALTHY"
 fi
 
-# Compatibility copies for quick access to the latest completed/partial scan.
+FOUND="$(wc -l < "$HEALTHY")"
 cp -f "$HEALTHY" /root/reality-healthy.txt 2>/dev/null || true
-cp -f "$OUT" /root/reality-scan-report.txt 2>/dev/null || true
 
 log
 log "======================================================================"
 log "Selected Docker : $XRAY_NAME ($XRAY_IMAGE)"
 log "Xray version    : $XRAY_VERSION"
-log "Requested       : $NEEDED"
-log "Healthy found   : $FOUND"
+log "Cert check      : $CERT_MODE"
+log "PQ visibility   : $PQ_MODE"
+log "Healthy found   : $FOUND / $NEEDED"
 log "Healthy list    : $HEALTHY"
 log "Detailed report : $OUT"
 log "======================================================================"
 
 if [ "$FOUND" -lt "$NEEDED" ]; then
-    log "[!] Only $FOUND targets passed every strict requirement in the scanned pool."
-    log "    No weak/partial targets were added just to reach $NEEDED."
+    log "[!] Only $FOUND targets passed every mandatory REALITY requirement in the scanned pool."
+    log "    No weak/partial targets were added merely to reach $NEEDED."
     exit 2
 fi
