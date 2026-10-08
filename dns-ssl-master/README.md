@@ -1,59 +1,67 @@
-# Master DNS SSL — interactive SSL on the master
+# Master DNS SSL — zero inbound ports, simple interactive SSL
 
-Ubuntu/Debian utility to issue Let's Encrypt TLS certificates on your MASTER through Cloudflare DNS-01, even when the domain's A/AAAA record points to a different NODE IP. No inbound 80/443 ports are required for issuing or renewing these certificates.
+Install Let's Encrypt certificates on a MASTER VPS using DNS-01, even when the hostname points to a different NODE IP. No inbound 80/443 required for issuance.
 
-## One-command installer
-
-Run on your master in an interactive SSH terminal:
+## Install with one command (Ubuntu/Debian)
 
     curl -fsSL https://raw.githubusercontent.com/smorad3363/Marzban-scripts/master/dns-ssl-master/install.sh -o /tmp/master-dns-ssl-install.sh && sudo bash /tmp/master-dns-ssl-install.sh
 
-Open the installed menu again:
+After installation:
 
     sudo master-dns-ssl
 
-## Features
+## Two easy modes
 
-- Interactive ANSI-colored terminal menu.
-- Cloudflare DNS-01 authorization, optionally including wildcard hosts.
-- Enter a domain, Let's Encrypt email, Cloudflare Zone ID, and masked API Token.
-- View, inspect, and force-renew issued certificates.
-- Pick a reload strategy for Nginx, Caddy, Marzban (Docker/systemd), no reload, or custom command.
-- Daily cron renewal check at 03:23 server time, reusing a pre-existing root acme.sh cron when found.
-- Automatic copying of renewed full-chain and private-key files; optional application reload.
-- No firewall configuration changes and no DNS A/AAAA modifications.
+### 1. Cloudflare auto — recommended for unattended cron renewal
 
-## Requirements
+Enter your domain, email and Cloudflare API Token (masked). You do NOT have to look up or enter a Zone ID. acme.sh detects the zone automatically.
 
-- Debian or Ubuntu with apt, SSH terminal, root/sudo.
-- Outbound HTTPS access to GitHub, Cloudflare, Let's Encrypt; functioning DNS.
-- Domain delegated to Cloudflare authoritative DNS.
-- Scoped Cloudflare API Token with Zone > DNS > Edit and Zone > Zone > Read permissions, limited to the relevant zone.
-- Cloudflare Zone ID (found on Cloudflare's zone overview page).
+Token permissions restricted to the correct zone:
 
-## Files
+- Zone / DNS / Edit
+- Zone / Zone / Read
 
-    /usr/local/sbin/master-dns-ssl
+The script gets a Let's Encrypt certificate using dns_cf, copies it to the install path, and configures a daily renewal check at 03:23 server time. No manual DNS records or changing A/AAAA records. A successful renewal triggers the configured reload command.
+
+### 2. Manual TXT — simplest for one-time issuance
+
+No Cloudflare API credentials are required. The script prints the DNS TXT record(s), and you add them in your DNS panel manually. This can work with other DNS providers too.
+
+For example, to cover the hostname german-hetzner.drwrdoh.org and its wildcard *.german-hetzner.drwrdoh.org, validation TXT records appear under:
+
+    _acme-challenge.german-hetzner.drwrdoh.org
+
+If both hostname and wildcard were selected, two TXT values at the same record name may be required. Keep both TXT values until validation succeeds.
+
+After adding the records and waiting for propagation, return to the menu and use option 6 to finish verification if you closed the initial prompt.
+
+**Manual TXT mode cannot automatically renew with cron.** DNS-01 values are different at each issuance or renewal. Use automatic Cloudflare API mode for uninterrupted renewals.
+
+## Manager menu
+
+1. Issue SSL (Cloudflare automatic / manual TXT)
+2. List certificates
+3. Inspect certificate
+4. Force renewal (intended for automatic DNS API mode)
+5. Cron status and logs
+6. Finish pending manual TXT challenge
+0. Exit
+
+## Certificate paths
+
     /etc/ssl/master-dns-ssl/<domain>/fullchain.pem
     /etc/ssl/master-dns-ssl/<domain>/privkey.pem
-    /etc/cron.d/master-dns-ssl
-    /var/log/master-dns-ssl.log
 
-The manager installs acme.sh under /root/.acme.sh. acme.sh retains Cloudflare DNS credentials in root-only configuration so unattended renewals can add temporary DNS TXT records.
+Installed launcher: /usr/local/sbin/master-dns-ssl.
 
-## How renewal works
+The Cloudflare API token is stored by acme.sh in root-only files under /root/.acme.sh; never commit or share these files.
 
-Every day a cron runs acme.sh --cron. acme.sh renews certificates only when appropriate (not every day). Successful renewals update the installed files and invoke the configured reload hook.
+## Notes
 
-If you pick "No reload", renewed certificate files are automatically replaced, but your running server may need to be reloaded to use the replacement.
+- The master certificate does not automatically configure TLS on a node that terminates client connections.
+- No inbound port is required for DNS-01 issuance, but your application may still need publicly accessible ports.
+- Choose a reload hook (Nginx, Caddy, Marzban, custom) for servers to read the new certificate automatically after renewal.
+- Outbound HTTPS and working DNS are still necessary.
+- Review internet-fetched code before running it with root privileges.
 
-## Important
-
-- The domain's A/AAAA records can remain pointed at your NODE throughout issuance and renewal.
-- The MASTER certificate does not itself secure HTTPS/TLS that terminates on the NODE; configure TLS on whichever server actually accepts client connections.
-- No inbound port is needed for DNS-01 issuance, but a public service may still need open ports for actual traffic.
-- Other DNS providers require their own API integrations; manual DNS cannot support unattended renewal.
-- Store the API Token securely and do not publish /root/.acme.sh.
-- Review remotely downloaded scripts before executing them as root.
-
-Uses the upstream official acme.sh project: https://github.com/acmesh-official/acme.sh
+Based on official acme.sh: https://github.com/acmesh-official/acme.sh
