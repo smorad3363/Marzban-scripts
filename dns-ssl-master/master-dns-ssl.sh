@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-MASTER_DNS_SSL_VERSION="2026.10.08-ux3"
+MASTER_DNS_SSL_VERSION="2026.10.08-ux5"
 ACME_HOME="/root/.acme.sh"
 ACME="$ACME_HOME/acme.sh"
 CERT_BASE="/var/lib/marzban/certs"
@@ -232,6 +232,51 @@ show_cert_paths() {
   say "PRIVATE KEY FILE (keyFile):"
   printf '%s\n' "$key"
   printf '%s\n' "============================================================"
+  if [[ -s "$dir/fullchain.pem" ]]; then
+    show_expiry "$dir/fullchain.pem" || true
+  fi
+}
+
+# Show expiry from the fullchain file installed for the user's service.
+show_expiry() {
+  local cert="$1" end_label end_epoch now_epoch days_left
+  [[ -s "$cert" ]] || { warn "Missing certificate: $cert"; return 1; }
+  end_label="$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null)" ||
+    { fail "Cannot read expiration date: $cert"; return 1; }
+  end_label="${end_label#notAfter=}"
+  say ""
+  say "CERTIFICATE EXPIRES (UTC):"
+  printf '%s\n' "$end_label"
+  if end_epoch="$(date -u -d "$end_label" +%s 2>/dev/null)"; then
+    now_epoch="$(date -u +%s)"
+    days_left=$(( (end_epoch - now_epoch) / 86400 ))
+    if (( days_left < 0 )); then
+      warn "CERTIFICATE EXPIRED: $((-days_left)) days ago"
+    else
+      printf 'DAYS REMAINING: %s\n' "$days_left"
+    fi
+  fi
+}
+
+# A no-TXT successful ACME response is only accepted when a valid newly
+# issued certificate covers both the apex and wildcard if requested.
+cert_is_current() {
+  local cert="$1" name="$2" want_wildcard="$3" parsed
+  [[ -s "$cert" ]] || return 1
+  openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null 2>&1 || return 1
+  parsed="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null |
+    tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" || return 1
+  grep -Fxq "DNS:$name" <<< "$parsed" || return 1
+  if (( want_wildcard )); then
+    grep -Fxq "DNS:*.$name" <<< "$parsed" || return 1
+  fi
+  return 0
+}
+manual_issue_completed() {
+  local rc="$1" logfile="$2" cert="$3" domain="$4" wildcard="$5"
+  (( rc == 0 )) || return 1
+  grep -Fq 'Cert success.' "$logfile" || return 1
+  cert_is_current "$cert" "$domain" "$wildcard"
 }
 
 # Print clean, copy-ready records from acme.sh manual mode.
@@ -485,10 +530,26 @@ issue_cert() {
     --yes-I-know-dns-manual-mode-enough-go-ahead-please > "$log" 2>&1 || rc=$?
   install -d -m 700 "$STATE_DIR"
   records="$STATE_DIR/$DOMAIN.txt-records"
-  if ! extract_txt_records "$log" "$records"; then
-    cat "$log"
+  # Reuse of a still-valid ACME authorization can allow the CA to
+  # sign immediately, without requiring any new DNS TXT challenges.
+  if manual_issue_completed "$rc" "$log" "$ACME_HOME/$DOMAIN/fullchain.cer" "$DOMAIN" "$WILDCARD"; then
     rm -f "$log"
-    fail "Could not extract the TXT values. See the original acme.sh output above."
+    good "Certificate issued directly using existing ACME authorization: no TXT needed."
+    install_cert_files manual || return 1
+    if [[ -f "$PENDING_FILE" ]]; then
+      local pending
+      IFS= read -r pending < "$PENDING_FILE" || true
+      if [[ "$pending" == "$DOMAIN" ]]; then
+        rm -f "$PENDING_FILE" "$STATE_DIR/$DOMAIN.txt-records"
+      fi
+    fi
+    warn "Future manual renewals can require new TXT values; DNS API is needed for unattended renewals."
+    return 0
+  fi
+  if ! extract_txt_records "$log" "$records"; then
+    tail -n 32 "$log"
+    rm -f "$log"
+    fail "No TXT records and no newly issued certificate were confirmed."
     return 1
   fi
   rm -f "$log"
@@ -582,7 +643,6 @@ list_certs() {
     if [[ -f "$dir/fullchain.pem" ]]; then
       seen["$dom"]=1; found=1
       printf '\n%s%s%s\n' "$GREEN" "$dom" "$RESET"
-      openssl x509 -in "$dir/fullchain.pem" -noout -enddate 2>/dev/null || true
       show_cert_paths "$dir"
     fi
   done
@@ -592,7 +652,6 @@ list_certs() {
     [[ -n "${seen[$dom]:-}" ]] && continue
     seen["$dom"]=1; found=1
     printf '\n%s%s%s\n' "$GREEN" "$dom" "$RESET"
-    openssl x509 -in "$dir/fullchain.pem" -noout -enddate 2>/dev/null || true
     show_cert_paths "$dir"
   done
   (( found == 1 )) || warn "No installed certificates found."
