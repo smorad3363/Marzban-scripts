@@ -229,7 +229,7 @@ issue_cert() {
     local proceed
     read -r -p "I have created ALL TXT records and they have propagated. Verify now? [y/N]: " proceed
     [[ "$proceed" == [yY] ]] || {
-      warn "Not verified. Run the manager again when you are ready."
+      warn "Challenge remains pending. Select menu option 6 to finish once TXT is public."
       return 0
     }
     say "STEP 2: Verify the existing manual DNS challenge."
@@ -259,6 +259,32 @@ issue_cert() {
   say "  Full chain: $out/fullchain.pem"
   say "  Private key: $out/privkey.pem"
   warn "If clients connect to NODE, configure TLS on the NODE as well."
+}
+
+finish_manual() {
+  banner
+  say "╭─ Complete pending manual TXT challenge ───────────╮"
+  ask_domain || return
+  if [[ ! -x "$ACME" ]]; then
+    fail "acme.sh is not installed. Start by choosing Issue SSL."
+    return 1
+  fi
+  say "All previously displayed _acme-challenge TXT records must be public."
+  read -r -p "I have added the TXT record(s). Continue? [y/N]: " proceed
+  [[ "$proceed" == [yY] ]] || return 0
+  if ! "$ACME" --renew --server letsencrypt -d "$DOMAIN" \
+    --yes-I-know-dns-manual-mode-enough-go-ahead-please; then
+    fail "DNS verification failed. Verify TXT records and propagation."
+    return 1
+  fi
+  choose_reload || return
+  local out="$CERT_BASE/$DOMAIN"
+  install -d -m 700 "$out"
+  "$ACME" --install-cert -d "$DOMAIN" --key-file "$out/privkey.pem" \
+    --fullchain-file "$out/fullchain.pem" --reloadcmd "$RELOAD_CMD" || return 1
+  chmod 600 "$out/privkey.pem"
+  good "Certificate installed: $DOMAIN"
+  warn "Manual TXT certificates do NOT auto-renew; create fresh TXT records at renewal."
 }
 
 list_certs() {
@@ -331,14 +357,16 @@ main() {
     printf '%s  3%s  View certificate details\n' "$BLUE" "$RESET"
     printf '%s  4%s  Force renew a domain\n' "$BLUE" "$RESET"
     printf '%s  5%s  Show cron & renewal logs\n' "$BLUE" "$RESET"
+    printf '%s  6%s  Finish pending manual TXT challenge\n' "$BLUE" "$RESET"
     printf '%s  0%s  Exit\n\n' "$BLUE" "$RESET"
-    read -r -p "  Select [0-5]: " choice || exit 0
+    read -r -p "  Select [0-6]: " choice || exit 0
     case "$choice" in
       1) issue_cert || true; pause ;;
       2) list_certs; pause ;;
       3) inspect_cert || true; pause ;;
       4) renew_now || true; pause ;;
       5) cron_status; pause ;;
+      6) finish_manual || true; pause ;;
       0) say "Bye!"; break ;;
       *) warn "Choose a number from 0 to 5."; pause ;;
     esac
