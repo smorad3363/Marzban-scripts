@@ -1,0 +1,21 @@
+name: Master DNS SSL shell syntax
+
+on:
+  push:
+    paths:
+      - 'dns-ssl-master/**'
+      - '.github/workflows/master-dns-ssl-check.yml'
+  workflow_dispatch:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: |
+          bash -n dns-ssl-master/install.sh
+          bash -n dns-ssl-master/master-dns-ssl.sh
+      - name: Check for unsafe legacy HTTP validation
+        run: |
+          ! grep -E -- '--standalone|--webroot|--nginx' dns-ssl-master/master-dns-ssl.sh
