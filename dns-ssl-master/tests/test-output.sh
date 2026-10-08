@@ -7,7 +7,7 @@ source_file="$repo_dir/master-dns-ssl.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-for func in show_cert_paths show_txt_records extract_txt_records; do
+for func in show_cert_paths show_expiry cert_is_current manual_issue_completed show_txt_records extract_txt_records; do
   awk -v func="$func" '
     $0 == func "() {" {printing=1}
     printing {print}
@@ -46,4 +46,27 @@ grep -Fxq '/var/lib/marzban/certs/drwsh.org/key.pem' <<< "$paths_output"
 grep -Fq 'CERTIFICATE FILE (certificateFile):' <<< "$paths_output"
 grep -Fq 'PRIVATE KEY FILE (keyFile):' <<< "$paths_output"
 
-echo "PASS: parsed 2 TXT challenges, rendered separate copyable values and TLS paths"
+# A domain that was already validated by ACME can be signed immediately.
+# Generate a real short-lived test certificate and verify exact SAN coverage,
+# no-TXT success detection, date output, and mismatched/failed cases.
+mkdir -p "$tmp/active"
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+  -keyout "$tmp/key.pem" -out "$tmp/active/fullchain.pem" \
+  -subj '/CN=drwsh.org' \
+  -addext 'subjectAltName=DNS:drwsh.org,DNS:*.drwsh.org' >/dev/null 2>&1
+cp "$tmp/key.pem" "$tmp/active/key.pem"
+printf '%s\n' 'Cert success.' > "$tmp/mock-success.log"
+manual_issue_completed 0 "$tmp/mock-success.log" "$tmp/active/fullchain.pem" drwsh.org 1
+if manual_issue_completed 1 "$tmp/mock-success.log" "$tmp/active/fullchain.pem" drwsh.org 1; then
+  echo 'FAIL: nonzero ACME return code treated as success' >&2; exit 1
+fi
+if manual_issue_completed 0 "$tmp/mock-success.log" "$tmp/active/fullchain.pem" other.org 1; then
+  echo 'FAIL: nonmatching certificate treated as success' >&2; exit 1
+fi
+actual="$(show_cert_paths "$tmp/active")"
+grep -Fq 'CERTIFICATE EXPIRES (UTC):' <<< "$actual"
+grep -Fq 'DAYS REMAINING:' <<< "$actual"
+grep -Fxq "$tmp/active/fullchain.pem" <<< "$actual"
+grep -Fxq "$tmp/active/key.pem" <<< "$actual"
+
+echo "PASS: TXT parsing, reused ACME validation, certificate expiry and copyable paths"
