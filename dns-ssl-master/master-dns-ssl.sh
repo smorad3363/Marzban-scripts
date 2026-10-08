@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
+MASTER_DNS_SSL_VERSION="2026.10.08-fix2"
 ACME_HOME="/root/.acme.sh"
 ACME="$ACME_HOME/acme.sh"
 CERT_BASE="/var/lib/marzban/certs"
@@ -48,6 +49,7 @@ banner() {
 ╚══════════════════════════════════════════════════╝
 ART
   printf '%s\n' "$RESET"
+  say "  Version: $MASTER_DNS_SSL_VERSION"
   say "  Domain may point to your NODE, not this MASTER."
   say "  No inbound 80/443 needed for certificate issuance."
   say ""
@@ -278,20 +280,33 @@ ensure_acme() {
       fail "Could not download acme.sh."
       return 1
     fi
-    local install_opts=(--install --nocron --home "$ACME_HOME")
-    if [[ -n "$ACCOUNT_EMAIL" ]]; then install_opts+=(--accountemail "$ACCOUNT_EMAIL"); fi
-    # acme.sh --install copies ./acme.sh, so it MUST run inside its source directory.
-    if ! (cd "$tmp/src" && ./acme.sh "${install_opts[@]}"); then
+    # Avoid upstream --install, which copies ./acme.sh relative to its own CWD
+    # and has failed on some systems. Install from verified ABSOLUTE paths.
+    if [[ ! -s "$tmp/src/acme.sh" || ! -f "$tmp/src/dnsapi/dns_cf.sh" ]]; then
       rm -rf "$tmp"
-      fail "acme.sh installation failed. Check output above."
+      fail "Incomplete acme.sh download (missing script or Cloudflare DNS API)."
       return 1
     fi
-    if [[ ! -x "$ACME" ]]; then
+    if ! (install -d -m 700 "$ACME_HOME" &&
+          install -m 755 "$tmp/src/acme.sh" "$ACME" &&
+          cp -a "$tmp/src/dnsapi" "$ACME_HOME/" &&
+          cp -a "$tmp/src/deploy" "$ACME_HOME/" &&
+          cp -a "$tmp/src/notify" "$ACME_HOME/"); then
       rm -rf "$tmp"
-      fail "acme.sh did not install to $ACME."
+      fail "Unable to copy acme.sh files into $ACME_HOME."
       return 1
     fi
     rm -rf "$tmp"
+    if [[ ! -x "$ACME" ]]; then
+      fail "acme.sh installation incomplete: $ACME is not executable."
+      return 1
+    fi
+    # Preserve existing account details when recovering a partial install.
+    # Account email is optional; a fake/random address must not be generated.
+    if [[ -n "$ACCOUNT_EMAIL" ]]; then
+      "$ACME" --register-account --server letsencrypt -m "$ACCOUNT_EMAIL" ||
+        warn "Account email registration failed; continuing to CA setup."
+    fi
   else
     # Cron might not exist on machines where acme.sh was installed previously.
     if ! command -v crontab >/dev/null 2>&1; then
