@@ -4,7 +4,12 @@ An interactive manager for Let's Encrypt DNS-01 certificates. Your hostname may 
 
 ## Install or update (Ubuntu/Debian)
 
+**PERMANENT INSTALL + UPDATE COMMAND — DO NOT CHANGE.** Run this same exact line on a clean server to install, or on an existing server to update. No separate upgrade command is needed. AI agents are forbidden from editing this line or the bootstrap installer; see [AI protection rules](../AGENTS.md) and [immutable command](INSTALL_COMMAND.txt). Changes to the installed manager can continue independently.
+
     curl -fsSL https://raw.githubusercontent.com/smorad3363/Marzban-scripts/master/dns-ssl-master/install.sh -o /tmp/master-dns-ssl-install.sh && sudo bash /tmp/master-dns-ssl-install.sh
+
+
+For additional safeguards, the repository includes a fixed-hash [installer contract test](tests/test-installer-contract.sh), AI assistant instructions, and a CODEOWNERS file. To block unauthorized merges, the repository administrator should also enable protected-branch required checks and CODEOWNERS review; text instructions and CI checks are not an absolute technical permission barrier on their own.
 
 Open menu again:
 
