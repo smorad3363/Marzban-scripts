@@ -370,8 +370,7 @@ finish_manual() {
   read -r -p "I have added the TXT record(s). Continue? [y/N]: " proceed
   [[ "$proceed" == [yY] ]] || return 0
   local force_pending=()
-  if [[ -f "$CERT_BASE/$DOMAIN/.mode" ]] &&
-     [[ "$(cat "$CERT_BASE/$DOMAIN/.mode")" == manual ]]; then
+  if [[ "$(cert_mode_for_domain)" == manual ]]; then
     force_pending=(--force)
   fi
   if ! "$ACME" --renew --server letsencrypt -d "$DOMAIN" \
@@ -392,13 +391,29 @@ finish_manual() {
 list_certs() {
   banner
   say "╭─ Managed certificates ────────────────────────────╮"
-  local dir found=0
-  for dir in "$CERT_BASE"/*; do
-    [[ -d "$dir" && -f "$dir/fullchain.pem" ]] || continue
-    found=1
-    printf '%s%s%s\n' "$GREEN" "${dir##*/}" "$RESET"
+  local dom dir marker found=0
+  local -A seen=()
+  for marker in "$STATE_DIR"/*.path; do
+    [[ -f "$marker" ]] || continue
+    dom="${marker##*/}"; dom="${dom%.path}"
+    valid_domain "$dom" || continue
+    DOMAIN="$dom"
+    dir="$(cert_dir_for_domain)"
+    if [[ -f "$dir/fullchain.pem" ]]; then
+      seen["$dom"]=1; found=1
+      printf '\n%s%s%s\n' "$GREEN" "$dom" "$RESET"
+      openssl x509 -in "$dir/fullchain.pem" -noout -enddate 2>/dev/null || true
+      show_cert_paths "$dir"
+    fi
+  done
+  for dir in "$CERT_BASE"/* "$LEGACY_BASE"/*; do
+    [[ -f "$dir/fullchain.pem" ]] || continue
+    dom="${dir##*/}"
+    [[ -n "${seen[$dom]:-}" ]] && continue
+    seen["$dom"]=1; found=1
+    printf '\n%s%s%s\n' "$GREEN" "$dom" "$RESET"
     openssl x509 -in "$dir/fullchain.pem" -noout -enddate 2>/dev/null || true
-    say "  $dir"
+    show_cert_paths "$dir"
   done
   (( found == 1 )) || warn "No installed certificates found."
 }
@@ -406,7 +421,9 @@ list_certs() {
 inspect_cert() {
   banner
   ask_domain || return
-  local cert="$CERT_BASE/$DOMAIN/fullchain.pem"
+  local dir cert
+  dir="$(cert_dir_for_domain)"
+  cert="$dir/fullchain.pem"
   if [[ ! -f "$cert" ]]; then fail "Certificate not found."; return 1; fi
   openssl x509 -in "$cert" -noout -subject -issuer -dates
   if openssl x509 -checkend 2592000 -noout -in "$cert" >/dev/null; then
@@ -414,25 +431,46 @@ inspect_cert() {
   else
     warn "Certificate expires within 30 days (or has expired)."
   fi
+  show_cert_paths "$dir"
+}
+
+change_cert_path() {
+  banner
+  say "╭─ Set or change certificate storage path ──────────╮"
+  ask_domain || return
+  local previous mode
+  previous="$(cert_dir_for_domain)"
+  if [[ ! -f "$previous/fullchain.pem" || ! -x "$ACME" ]]; then
+    fail "No installed certificate for this domain."
+    return 1
+  fi
+  mode="$(cert_mode_for_domain)"
+  say "Currently installed: $previous"
+  ask_cert_path "$CERT_BASE/$DOMAIN" || return
+  check_destination "$previous" || return
+  choose_reload || return
+  install_cert_files "$mode" || return 1
+  if [[ "$mode" == auto ]]; then ensure_cron; fi
+  say "Old files at $previous were left untouched. Remove them manually if unused."
 }
 
 renew_now() {
   banner
   ask_domain || return
-  if [[ ! -x "$ACME" || ! -f "$CERT_BASE/$DOMAIN/fullchain.pem" ]]; then
+  if [[ ! -x "$ACME" || ! -f "$(cert_dir_for_domain)/fullchain.pem" ]]; then
     fail "This domain is not installed."
     return 1
   fi
-  if [[ -f "$CERT_BASE/$DOMAIN/.mode" ]] &&
-     [[ "$(cat "$CERT_BASE/$DOMAIN/.mode")" == manual ]]; then
+  if [[ "$(cert_mode_for_domain)" == manual ]]; then
     warn "Manual TXT cannot renew without new TXT values. Choose menu option 1, then manual TXT."
     return 0
   fi
   warn "Force renewal may trigger Let's Encrypt rate limits. Use only when necessary."
   read -r -p "Force renewal now? [y/N]: " yes
   [[ "$yes" == [yY] ]] || return 0
-  "$ACME" --renew -d "$DOMAIN" --server letsencrypt --force
+  "$ACME" --renew -d "$DOMAIN" --server letsencrypt --force || return 1
   good "Renewal completed (configured install/reload hook runs on successful renewal)."
+  show_cert_paths "$(cert_dir_for_domain)"
 }
 
 cron_status() {
@@ -465,8 +503,9 @@ main() {
     printf '%s  4%s  Force renew a domain\n' "$BLUE" "$RESET"
     printf '%s  5%s  Show cron & renewal logs\n' "$BLUE" "$RESET"
     printf '%s  6%s  Finish pending manual TXT challenge\n' "$BLUE" "$RESET"
+    printf '%s  7%s  Change certificate save directory\n' "$BLUE" "$RESET"
     printf '%s  0%s  Exit\n\n' "$BLUE" "$RESET"
-    read -r -p "  Select [0-6]: " choice || exit 0
+    read -r -p "  Select [0-7]: " choice || exit 0
     case "$choice" in
       1) issue_cert || true; pause ;;
       2) list_certs; pause ;;
@@ -474,8 +513,9 @@ main() {
       4) renew_now || true; pause ;;
       5) cron_status; pause ;;
       6) finish_manual || true; pause ;;
+      7) change_cert_path || true; pause ;;
       0) say "Bye!"; break ;;
-      *) warn "Choose a number from 0 to 5."; pause ;;
+      *) warn "Choose a number from 0 to 7."; pause ;;
     esac
   done
 }
