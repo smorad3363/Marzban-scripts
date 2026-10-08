@@ -475,35 +475,32 @@ issue_cert() {
   fi
 
   say ""
-  say "STEP 1/2: Create the TXT records shown below."
-  if (( WILDCARD )); then
-    say "For root + wildcard, you normally need TWO TXT values at the same DNS name."
-  fi
-  say "──────────────────────────────────────────────────"
-  local log rc=0
+  say "Preparing DNS-01 TXT values for $DOMAIN ..."
+  local log rc=0 records
   log="$(mktemp)"
   local force_issue=()
   if (( manual_reissue )); then force_issue=(--force); fi
   "$ACME" --issue --server letsencrypt --dns --keylength 2048 \
     "${args[@]}" "${force_issue[@]}" \
-    --yes-I-know-dns-manual-mode-enough-go-ahead-please 2>&1 | tee "$log" || rc=$?
-  if (( rc != 0 )) && ! grep -Fq "Add the following TXT record" "$log"; then
+    --yes-I-know-dns-manual-mode-enough-go-ahead-please > "$log" 2>&1 || rc=$?
+  install -d -m 700 "$STATE_DIR"
+  records="$STATE_DIR/$DOMAIN.txt-records"
+  if ! extract_txt_records "$log" "$records"; then
+    cat "$log"
     rm -f "$log"
-    fail "Unable to prepare the DNS TXT challenge. Review errors above."
+    fail "Could not extract the TXT values. See the original acme.sh output above."
     return 1
   fi
   rm -f "$log"
-
-  install -d -m 700 "$STATE_DIR"
   printf '%s\n' "$DOMAIN" > "$PENDING_FILE"
   chmod 600 "$PENDING_FILE"
-  say "──────────────────────────────────────────────────"
+  show_txt_records "$records" || return 1
   say ""
-  warn "WAIT for all TXT records to propagate before verifying."
+  warn "Wait until ALL TXT values are publicly visible. Do not verify too early."
   local ready
-  read -r -p "TXT records ready? Press ENTER to verify, or q to finish later: " ready
+  read -r -p "Press ENTER to verify or q to finish later: " ready
   if [[ "$ready" == [qQ] ]]; then
-    say "Saved pending challenge for $DOMAIN. Use menu option 6 later."
+    say "Saved TXT values for $DOMAIN. Menu option 6 can show them again."
     return 0
   fi
   complete_manual
@@ -523,22 +520,30 @@ complete_manual() {
     fail "acme.sh is not installed."
     return 1
   fi
-  say "STEP 2/2: Verifying TXT records for $DOMAIN"
-  local force_pending=()
+  say "Verifying DNS TXT records for $DOMAIN ..."
+  local force_pending=() verify_log
   if [[ "$(cert_mode_for_domain)" == manual ]]; then force_pending=(--force); fi
+  verify_log="$(mktemp)"
   if ! "$ACME" --renew --server letsencrypt -d "$DOMAIN" \
-    "${force_pending[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please; then
-    fail "Validation failed. Keep the TXT values and check propagation."
-    say "Run menu option 6 when DNS is ready, using the SAME TXT values."
+    "${force_pending[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please \
+    > "$verify_log" 2>&1; then
+    tail -n 35 "$verify_log"
+    rm -f "$verify_log"
+    fail "Validation failed. Check TXT values and propagation."
+    say "Menu option 6 displays the SAME pending TXT values without reissuing."
     return 1
   fi
+  rm -f "$verify_log"
+  good "Let's Encrypt issued your certificate successfully."
 
   CERT_DIR="$(cert_dir_for_domain)"
   install_cert_files manual || return 1
   if [[ -f "$PENDING_FILE" ]]; then
     local pending
     IFS= read -r pending < "$PENDING_FILE" || true
-    [[ "$pending" == "$DOMAIN" ]] && rm -f "$PENDING_FILE"
+    if [[ "$pending" == "$DOMAIN" ]]; then
+      rm -f "$PENDING_FILE" "$STATE_DIR/$DOMAIN.txt-records"
+    fi
   fi
   warn "Manual DNS certificates require NEW TXT records for every renewal."
   return 0
@@ -548,9 +553,17 @@ finish_manual() {
   banner
   say "╭─ Finish pending TXT verification ────────────────╮"
   if [[ -f "$PENDING_FILE" ]]; then
-    local pending
+    local pending ready
     IFS= read -r pending < "$PENDING_FILE" || true
-    say "Pending domain: $pending (no need to type it again)"
+    if ! valid_domain "$pending"; then fail "Invalid pending domain."; return 1; fi
+    DOMAIN="$pending"
+    say "Pending domain: $DOMAIN"
+    if [[ -f "$STATE_DIR/$DOMAIN.txt-records" ]]; then
+      show_txt_records "$STATE_DIR/$DOMAIN.txt-records" || return 1
+    fi
+    say ""
+    read -r -p "Press ENTER to verify, or q to return to menu: " ready
+    [[ "$ready" == [qQ] ]] && return 0
   fi
   complete_manual
 }
