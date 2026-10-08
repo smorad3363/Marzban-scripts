@@ -131,10 +131,14 @@ check_destination() {
 }
 
 show_cert_paths() {
-  local dir="$1"
+  local dir="$1" key="$1/key.pem"
+  # Files from earlier versions used privkey.pem instead of key.pem.
+  if [[ ! -f "$key" && -f "$dir/privkey.pem" ]]; then
+    key="$dir/privkey.pem"
+  fi
   say ""
-  printf '%sCertificate file:%s %s\n' "$GREEN" "$RESET" "$dir/fullchain.pem"
-  printf '%sPrivate key file:%s %s\n' "$GREEN" "$RESET" "$dir/key.pem"
+  printf '%sCertificate file (fullchain):%s %s\n' "$GREEN" "$RESET" "$dir/fullchain.pem"
+  printf '%sPrivate key file:%s %s\n' "$GREEN" "$RESET" "$key"
   say "Use these paths in the certificateFile and keyFile fields for VLESS TCP TLS."
 }
 
