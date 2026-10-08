@@ -118,7 +118,6 @@ ensure_acme() {
     fi
   fi
   "$ACME" --set-default-ca --server letsencrypt
-  ensure_cron
 }
 
 choose_reload() {
@@ -156,62 +155,110 @@ issue_cert() {
   ask_domain || return
   if [[ -f "$CERT_BASE/$DOMAIN/fullchain.pem" ]]; then
     warn "Already installed: $CERT_BASE/$DOMAIN"
-    say "Use the 'Renew now' menu option for existing domains."
+    say "Certificate already exists. Use the renew option."
     return
   fi
   ask_email || return
 
   say ""
-  say "Cloudflare: create an API Token scoped to this zone:"
-  say "  Zone / DNS / Edit   +   Zone / Zone / Read"
-  say "Get the Zone ID from Cloudflare > your domain > Overview."
-  read -r -p "Cloudflare Zone ID (32 hex chars): " CF_Zone_ID
-  if [[ ! "$CF_Zone_ID" =~ ^[a-fA-F0-9]{32}$ ]]; then
-    fail "Zone ID must be 32 hexadecimal characters."
-    return 1
-  fi
-  read -r -s -p "Cloudflare API Token (hidden): " CF_Token
-  printf '\n'
-  if [[ -z "$CF_Token" ]]; then
-    fail "API Token cannot be empty."
+  say "How do you want to prove domain ownership?"
+  say "  1) Cloudflare auto (one API Token, NO Zone ID) - renews automatically"
+  say "  2) Manual DNS TXT (NO API Token) - renew each time manually"
+  local mode
+  read -r -p "Choose [1/2]: " mode
+  if [[ "$mode" != 1 && "$mode" != 2 ]]; then
+    fail "Choose 1 or 2."
     return 1
   fi
 
-  local wildcard=""
-  read -r -p "Also cover *.$DOMAIN (wildcard)? [y/N]: " wildcard
+  local wildcard
+  read -r -p "Also include *.$DOMAIN (wildcard)? [Y/n]: " wildcard
+  local args=(-d "$DOMAIN")
+  if [[ "$wildcard" != [nN] ]]; then
+    args+=(-d "*.$DOMAIN")
+  fi
   choose_reload || return
 
-  say ""
-  warn "Keep your token private. acme.sh stores credentials under /root/.acme.sh (root-only)."
-  warn "This will NOT change any A/AAAA DNS record or open firewall ports."
-  read -r -p "Proceed? [y/N]: " confirm
-  [[ "$confirm" == [yY] ]] || { say "Cancelled."; return; }
-
-  ensure_acme || return 1
-  local args=(-d "$DOMAIN")
-  if [[ "$wildcard" == [yY] ]]; then args+=(-d "*.$DOMAIN"); fi
-
-  export CF_Token CF_Zone_ID
-  if ! "$ACME" --issue --server letsencrypt --dns dns_cf --keylength 2048 "${args[@]}"; then
-    unset CF_Token CF_Zone_ID
-    fail "Issuance failed. Check API token, DNS zone, and outbound HTTPS/DNS."
-    return 1
+  if [[ "$mode" == 1 ]]; then
+    say ""
+    say "Cloudflare API Token permission: Zone/DNS/Edit and Zone/Zone/Read."
+    say "Restrict token scope to the DNS zone containing $DOMAIN."
+    read -r -s -p "Cloudflare API Token (hidden): " CF_Token
+    printf '\n'
+    if [[ -z "$CF_Token" ]]; then
+      fail "API Token cannot be empty."
+      return 1
+    fi
+    warn "acme.sh stores DNS credentials in /root/.acme.sh for unattended renewal."
+  else
+    say ""
+    warn "MANUAL TXT: Every renewal needs NEW TXT records. Cron CANNOT renew this certificate automatically."
+    say "The next command prints TXT names and values; copy ALL of them to your DNS provider."
+    say "If you requested the domain + wildcard, you may need TWO TXT values with the same record name."
   fi
-  unset CF_Token CF_Zone_ID
+
+  say "No A/AAAA change and no inbound port opening is needed."
+  local confirm
+  read -r -p "Continue? [y/N]: " confirm
+  [[ "$confirm" == [yY] ]] || { say "Cancelled."; return; }
+  ensure_acme || return 1
+
+  if [[ "$mode" == 1 ]]; then
+    # Let acme.sh discover Cloudflare Zone ID automatically.
+    export CF_Token
+    unset CF_Zone_ID CF_Account_ID || true
+    if ! "$ACME" --issue --server letsencrypt --dns dns_cf --keylength 2048 "${args[@]}"; then
+      unset CF_Token
+      fail "Issuance failed. Check Cloudflare permissions and outbound HTTPS/DNS."
+      return 1
+    fi
+    unset CF_Token
+  else
+    say ""
+    say "STEP 1: Generate manual challenge. Save the displayed TXT record(s)."
+    say "--------------------------------------------------------------------"
+    # Manual --issue normally exits before obtaining a cert; the operator
+    # must add the challenge TXT records and then complete with --renew.
+    "$ACME" --issue --server letsencrypt --dns --keylength 2048 \
+      "${args[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please || true
+    say "--------------------------------------------------------------------"
+    say ""
+    warn "Add the displayed TXT records in your authoritative DNS panel."
+    say "Wait until they are publicly visible (DNS propagation)."
+    say "TXT record name usually starts with _acme-challenge.$DOMAIN."
+    local proceed
+    read -r -p "I have created ALL TXT records and they have propagated. Verify now? [y/N]: " proceed
+    [[ "$proceed" == [yY] ]] || {
+      warn "Not verified. Run the manager again when you are ready."
+      return 0
+    }
+    say "STEP 2: Verify the existing manual DNS challenge."
+    if ! "$ACME" --renew --server letsencrypt -d "$DOMAIN" \
+      --yes-I-know-dns-manual-mode-enough-go-ahead-please; then
+      fail "Validation failed. Check TXT names/values and DNS propagation."
+      warn "Use the manual option again to generate fresh challenges if necessary."
+      return 1
+    fi
+  fi
 
   local out="$CERT_BASE/$DOMAIN"
   install -d -m 700 "$out"
   if ! "$ACME" --install-cert -d "$DOMAIN" --key-file "$out/privkey.pem" \
      --fullchain-file "$out/fullchain.pem" --reloadcmd "$RELOAD_CMD"; then
-    fail "Certificate issued but installation failed. Run setup again after checking logs."
+    fail "Certificate issued but installation failed. Check acme.sh logs."
     return 1
   fi
   chmod 600 "$out/privkey.pem"
-  good "SSL installed! $DOMAIN"
+  if [[ "$mode" == 1 ]]; then
+    ensure_cron
+    good "SSL installed with automatic cron renewal! $DOMAIN"
+  else
+    good "SSL installed! $DOMAIN"
+    warn "MANUAL MODE: update DNS TXT and renew manually before expiration."
+  fi
   say "  Full chain: $out/fullchain.pem"
   say "  Private key: $out/privkey.pem"
-  say "  Renewals: acme.sh checks daily via cron and updates installed files."
-  warn "If clients connect to NODE, NODE also needs TLS configuration/its own cert."
+  warn "If clients connect to NODE, configure TLS on the NODE as well."
 }
 
 list_certs() {
@@ -279,7 +326,7 @@ main() {
   local choice
   while true; do
     banner
-    printf '%s  1%s  Issue SSL (Cloudflare DNS-01)\n' "$BLUE" "$RESET"
+    printf '%s  1%s  Issue SSL (Auto Cloudflare / Manual TXT)\n' "$BLUE" "$RESET"
     printf '%s  2%s  List certificates\n' "$BLUE" "$RESET"
     printf '%s  3%s  View certificate details\n' "$BLUE" "$RESET"
     printf '%s  4%s  Force renew a domain\n' "$BLUE" "$RESET"
