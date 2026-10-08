@@ -87,7 +87,7 @@ load_settings() {
   fi
   if [[ -f "$SETTINGS_DIR/wildcard" ]]; then
     IFS= read -r v < "$SETTINGS_DIR/wildcard" || true
-    [[ "$v" == 0 ]] && WILDCARD=0
+    if [[ "$v" == 0 ]]; then WILDCARD=0; fi
   fi
 }
 save_setting() {
