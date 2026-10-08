@@ -21,6 +21,8 @@ bash -n "$tmp"
 install -m 0755 "$tmp" /usr/local/sbin/master-dns-ssl
 echo "Installed: /usr/local/sbin/master-dns-ssl"
 echo "Rerun later: sudo master-dns-ssl"
+rm -f "$tmp"
+trap - EXIT
 
 # Support pipe-based bootstrap on an interactive SSH terminal.
 if [[ ! -t 0 && -r /dev/tty ]]; then
