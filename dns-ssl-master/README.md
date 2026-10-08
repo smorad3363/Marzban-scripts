@@ -94,6 +94,14 @@ Successful certificate verification no longer dumps a complete PEM certificate i
 
 If verification is deferred, menu option 6 displays the **previously generated** pending TXT records again. Once issuance succeeds, pending TXT values are removed from local state and the certificate paths remain in menu options 3 and 4.
 
+## Expiration and already-verified ACME challenges (v2026.10.08-ux5)
+
+The app displays the certificate expiration date in UTC and the number of remaining days next to the exact `fullchain.pem` and `key.pem` paths. Menu options 3 and 4 display this information for already-installed certificates.
+
+If the CA has an unexpired prior domain authorization, a fresh certificate can be issued immediately, **without prompting for any new TXT records**. The manager now recognizes that successful response and installs the signed certificate instead of reporting a TXT parsing error. For certificates already installed and valid for at least 30 more days, the manual-issue menu shows their paths and expiration and does not issue another unnecessary certificate.
+
+For fully unattended wildcard issuance or renewal, an IP or DNS A record is not sufficient. DNS-01 must be automated using the DNS provider API (Cloudflare option 2) or delegated to an API-managed challenge zone. Manual TXT never guarantees automatic renewal.
+
 ## Advanced Settings (option 8)
 
 - Change default base directory; every new hostname still gets a distinct subfolder.
