@@ -16,6 +16,17 @@ jobs:
         run: |
           bash -n dns-ssl-master/install.sh
           bash -n dns-ssl-master/master-dns-ssl.sh
+      - name: Smoke-test upstream acme.sh installation (no certificates issued)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          git clone -q --depth 1 https://github.com/acmesh-official/acme.sh.git "$tmp/src"
+          # acme.sh --install copies ./acme.sh; cwd must be its source folder.
+          (cd "$tmp/src" && ./acme.sh --install --nocron --home "$tmp/install")
+          test -x "$tmp/install/acme.sh"
+          "$tmp/install/acme.sh" --version
       - name: Check for unsafe legacy HTTP validation
         run: |
           ! grep -E -- '--standalone|--webroot|--nginx' dns-ssl-master/master-dns-ssl.sh
