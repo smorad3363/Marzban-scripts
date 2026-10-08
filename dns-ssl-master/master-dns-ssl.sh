@@ -50,7 +50,7 @@ ART
 }
 
 valid_domain() {
-  [[ $# -eq 1 && \${#1} -le 253 && "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
+  [[ $# -eq 1 && ${#1} -le 253 && "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
 }
 
 ask_domain() {
@@ -192,7 +192,7 @@ issue_cert() {
   if [[ "$wildcard" == [yY] ]]; then args+=(-d "*.$DOMAIN"); fi
 
   export CF_Token CF_Zone_ID
-  if ! "$ACME" --issue --server letsencrypt --dns dns_cf --keylength 2048 "\${args[@]}"; then
+  if ! "$ACME" --issue --server letsencrypt --dns dns_cf --keylength 2048 "${args[@]}"; then
     unset CF_Token CF_Zone_ID
     fail "Issuance failed. Check API token, DNS zone, and outbound HTTPS/DNS."
     return 1
@@ -221,7 +221,7 @@ list_certs() {
   for dir in "$CERT_BASE"/*; do
     [[ -d "$dir" && -f "$dir/fullchain.pem" ]] || continue
     found=1
-    printf '%s%s%s\n' "$GREEN" "\${dir##*/}" "$RESET"
+    printf '%s%s%s\n' "$GREEN" "${dir##*/}" "$RESET"
     openssl x509 -in "$dir/fullchain.pem" -noout -enddate 2>/dev/null || true
     say "  $dir"
   done
