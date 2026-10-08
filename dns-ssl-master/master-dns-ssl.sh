@@ -577,25 +577,29 @@ main() {
   local choice
   while true; do
     banner
-    printf '%s  1%s  Issue SSL (Auto Cloudflare / Manual TXT)\n' "$BLUE" "$RESET"
-    printf '%s  2%s  List certificates\n' "$BLUE" "$RESET"
-    printf '%s  3%s  View certificate details\n' "$BLUE" "$RESET"
-    printf '%s  4%s  Force renew a domain\n' "$BLUE" "$RESET"
-    printf '%s  5%s  Show cron & renewal logs\n' "$BLUE" "$RESET"
-    printf '%s  6%s  Finish pending manual TXT challenge\n' "$BLUE" "$RESET"
-    printf '%s  7%s  Change certificate save directory\n' "$BLUE" "$RESET"
+    printf '%s  1%s  Manual TXT SSL (root + wildcard) [simple]\n' "$BLUE" "$RESET"
+    printf '%s  2%s  Cloudflare SSL + auto-renewal\n' "$BLUE" "$RESET"
+    printf '%s  3%s  List certificates and file paths\n' "$BLUE" "$RESET"
+    printf '%s  4%s  Certificate details\n' "$BLUE" "$RESET"
+    printf '%s  5%s  Force renew an API certificate\n' "$BLUE" "$RESET"
+    printf '%s  6%s  Finish pending manual TXT verification\n' "$BLUE" "$RESET"
+    printf '%s  7%s  Show cron and renewal logs\n' "$BLUE" "$RESET"
+    printf '%s  8%s  Advanced settings (paths / reload / email)\n' "$BLUE" "$RESET"
+    printf '%s  9%s  Change an existing certificate directory\n' "$BLUE" "$RESET"
     printf '%s  0%s  Exit\n\n' "$BLUE" "$RESET"
-    read -r -p "  Select [0-7]: " choice || exit 0
+    read -r -p "  Select [0-9]: " choice || exit 0
     case "$choice" in
-      1) issue_cert || true; pause ;;
-      2) list_certs; pause ;;
-      3) inspect_cert || true; pause ;;
-      4) renew_now || true; pause ;;
-      5) cron_status; pause ;;
+      1) issue_cert manual || true; pause ;;
+      2) issue_cert auto || true; pause ;;
+      3) list_certs || true; pause ;;
+      4) inspect_cert || true; pause ;;
+      5) renew_now || true; pause ;;
       6) finish_manual || true; pause ;;
-      7) change_cert_path || true; pause ;;
+      7) cron_status || true; pause ;;
+      8) settings_menu || true ;;
+      9) load_settings; change_cert_path || true; pause ;;
       0) say "Bye!"; break ;;
-      *) warn "Choose a number from 0 to 7."; pause ;;
+      *) warn "Choose a number from 0 to 9."; pause ;;
     esac
   done
 }
