@@ -1,0 +1,9 @@
+# Require maintainer review when branch protection's CODEOWNERS review is enabled.
+/dns-ssl-master/install.sh @smorad3363
+/dns-ssl-master/INSTALL_COMMAND.txt @smorad3363
+/dns-ssl-master/README.md @smorad3363
+/dns-ssl-master/tests/test-installer-contract.sh @smorad3363
+/.github/workflows/master-dns-ssl-check.yml @smorad3363
+/AGENTS.md @smorad3363
+/.github/copilot-instructions.md @smorad3363
+/.github/CODEOWNERS @smorad3363
