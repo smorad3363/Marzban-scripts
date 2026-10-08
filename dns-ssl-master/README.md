@@ -62,6 +62,33 @@ Both file paths are displayed after installation, in "List certificates", and in
 9. Change existing certificate directory
 0. Exit
 
+
+## Clear copy-ready output (v2026.10.08-ux3)
+
+For manual issuance, the script now captures the verbose acme.sh output and displays each requested DNS record separately. Example layout:
+
+    ------------------ TXT RECORD 1 ------------------
+    TYPE:
+    TXT
+    NAME (FULL DNS NAME):
+    _acme-challenge.example.org
+    CLOUDFLARE NAME (only if the DNS zone itself is example.org):
+    _acme-challenge
+    CONTENT / TXT VALUE (copy the next line exactly):
+    <the actual token from your run>
+
+With wildcard enabled there are normally **two values at the same Name**; create two TXT records, don't replace the first value with the second. For subdomains, use the FULL DNS NAME or the label relative to the DNS zone that owns the records. Cloudflare automatically appends that zone to relative Name fields.
+
+Successful certificate verification no longer dumps a complete PEM certificate into the console. The paths are printed as two standalone copyable lines:
+
+    CERTIFICATE FILE (certificateFile):
+    /var/lib/marzban/certs/example.org/fullchain.pem
+
+    PRIVATE KEY FILE (keyFile):
+    /var/lib/marzban/certs/example.org/key.pem
+
+If verification is deferred, menu option 6 displays the **previously generated** pending TXT records again. Once issuance succeeds, pending TXT values are removed from local state and the certificate paths remain in menu options 3 and 4.
+
 ## Advanced Settings (option 8)
 
 - Change default base directory; every new hostname still gets a distinct subfolder.
