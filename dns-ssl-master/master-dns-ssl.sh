@@ -5,7 +5,9 @@ umask 077
 
 ACME_HOME="/root/.acme.sh"
 ACME="$ACME_HOME/acme.sh"
-CERT_BASE="/etc/ssl/master-dns-ssl"
+CERT_BASE="/var/lib/marzban/certs"
+LEGACY_BASE="/etc/ssl/master-dns-ssl"
+STATE_DIR="/etc/master-dns-ssl/domains"
 CRON_FILE="/etc/cron.d/master-dns-ssl"
 
 if [[ -t 1 ]]; then
@@ -69,6 +71,90 @@ ask_email() {
     fail "Invalid email."
     return 1
   fi
+}
+
+
+cert_dir_for_domain() {
+  local saved=""
+  if [[ -f "$STATE_DIR/$DOMAIN.path" ]]; then
+    IFS= read -r saved < "$STATE_DIR/$DOMAIN.path" || true
+    if [[ "$saved" == /* && "$saved" != "/" ]]; then
+      printf '%s\n' "$saved"
+      return
+    fi
+  fi
+  # Backward compatible with installations from previous versions.
+  if [[ -f "$LEGACY_BASE/$DOMAIN/fullchain.pem" ]]; then
+    printf '%s\n' "$LEGACY_BASE/$DOMAIN"
+  else
+    printf '%s\n' "$CERT_BASE/$DOMAIN"
+  fi
+}
+
+cert_mode_for_domain() {
+  if [[ -f "$STATE_DIR/$DOMAIN.mode" ]]; then
+    head -n 1 "$STATE_DIR/$DOMAIN.mode"
+  elif [[ -f "$LEGACY_BASE/$DOMAIN/.mode" ]]; then
+    head -n 1 "$LEGACY_BASE/$DOMAIN/.mode"
+  else
+    printf 'unknown\n'
+  fi
+}
+
+ask_cert_path() {
+  local suggested="${1:-$CERT_BASE/$DOMAIN}" entered
+  say ""
+  say "Where should fullchain.pem and key.pem be saved?"
+  read -r -p "Certificate directory [$suggested]: " entered
+  CERT_DIR="${entered:-$suggested}"
+  CERT_DIR="${CERT_DIR%/}"
+  if [[ "$CERT_DIR" != /* || "$CERT_DIR" == "" ||
+        "$CERT_DIR" == *$'\n'* || "$CERT_DIR" == *$'\r'* ||
+        "$CERT_DIR" == *"/../"* || "$CERT_DIR" == *"/./"* ||
+        "$CERT_DIR" == *"/.." || "$CERT_DIR" == *"/." ||
+        "$CERT_DIR" == "/" ]]; then
+    fail "Enter a valid absolute directory path."
+    return 1
+  fi
+  say "  Cert: $CERT_DIR/fullchain.pem"
+  say "  Key:  $CERT_DIR/key.pem"
+}
+
+check_destination() {
+  local previous="${1:-}"
+  if [[ "$CERT_DIR" == "$previous" ]]; then return 0; fi
+  if [[ -e "$CERT_DIR/fullchain.pem" || -e "$CERT_DIR/key.pem" ||
+        -L "$CERT_DIR/fullchain.pem" || -L "$CERT_DIR/key.pem" ]]; then
+    fail "Files already exist there. Choose another directory to avoid overwriting."
+    return 1
+  fi
+}
+
+show_cert_paths() {
+  local dir="$1"
+  say ""
+  printf '%sCertificate file:%s %s\n' "$GREEN" "$RESET" "$dir/fullchain.pem"
+  printf '%sPrivate key file:%s %s\n' "$GREEN" "$RESET" "$dir/key.pem"
+  say "Use these paths in the certificateFile and keyFile fields for VLESS TCP TLS."
+}
+
+install_cert_files() {
+  local cert_mode="$1" out="$CERT_DIR"
+  install -d -m 700 "$out"
+  # acme.sh persists install locations and reload hook for future renewals.
+  if ! "$ACME" --install-cert -d "$DOMAIN" --key-file "$out/key.pem" \
+    --fullchain-file "$out/fullchain.pem" --reloadcmd "$RELOAD_CMD"; then
+    fail "Failed to install certificate into $out. Check acme.sh logs."
+    return 1
+  fi
+  chmod 600 "$out/key.pem"
+  chmod 644 "$out/fullchain.pem"
+  install -d -m 700 "$STATE_DIR"
+  printf '%s\n' "$out" > "$STATE_DIR/$DOMAIN.path"
+  printf '%s\n' "$cert_mode" > "$STATE_DIR/$DOMAIN.mode"
+  chmod 600 "$STATE_DIR/$DOMAIN.path" "$STATE_DIR/$DOMAIN.mode"
+  good "Certificate saved."
+  show_cert_paths "$out"
 }
 
 ensure_cron() {
@@ -153,17 +239,17 @@ issue_cert() {
   banner
   say "╭─ Issue a new certificate ─────────────────────────╮"
   ask_domain || return
-  local manual_reissue=0
-  if [[ -f "$CERT_BASE/$DOMAIN/fullchain.pem" ]]; then
-    if [[ -f "$CERT_BASE/$DOMAIN/.mode" ]] &&
-       [[ "$(cat "$CERT_BASE/$DOMAIN/.mode")" == manual ]]; then
+  local manual_reissue=0 existing
+  existing="$(cert_dir_for_domain)"
+  if [[ -f "$existing/fullchain.pem" ]]; then
+    if [[ "$(cert_mode_for_domain)" == manual ]]; then
       warn "This domain uses MANUAL TXT. New TXT records are required to renew."
       read -r -p "Start manual renewal with fresh TXT values? [y/N]: " yes
       [[ "$yes" == [yY] ]] || return 0
       manual_reissue=1
     else
-      warn "Already installed: $CERT_BASE/$DOMAIN"
-      say "Use menu option 4 to renew an API-issued certificate."
+      warn "Already installed: $existing"
+      say "Use option 4 to renew, or option 7 to change certificate paths."
       return
     fi
   fi
@@ -190,6 +276,8 @@ issue_cert() {
   if [[ "$wildcard" != [nN] ]]; then
     args+=(-d "*.$DOMAIN")
   fi
+  ask_cert_path "$existing" || return
+  check_destination "$existing" || return
   choose_reload || return
 
   if [[ "$mode" == 1 ]]; then
@@ -259,27 +347,14 @@ issue_cert() {
     fi
   fi
 
-  local out="$CERT_BASE/$DOMAIN"
-  install -d -m 700 "$out"
-  if ! "$ACME" --install-cert -d "$DOMAIN" --key-file "$out/privkey.pem" \
-     --fullchain-file "$out/fullchain.pem" --reloadcmd "$RELOAD_CMD"; then
-    fail "Certificate issued but installation failed. Check acme.sh logs."
-    return 1
-  fi
-  chmod 600 "$out/privkey.pem"
   if [[ "$mode" == 1 ]]; then
-    printf '%s\n' auto > "$out/.mode"
-    chmod 600 "$out/.mode"
+    install_cert_files auto || return 1
     ensure_cron
-    good "SSL installed with automatic cron renewal! $DOMAIN"
+    good "Automatic DNS API renewal enabled for $DOMAIN"
   else
-    printf '%s\n' manual > "$out/.mode"
-    chmod 600 "$out/.mode"
-    good "SSL installed! $DOMAIN"
-    warn "MANUAL MODE: update DNS TXT and renew manually before expiration."
+    install_cert_files manual || return 1
+    warn "MANUAL TXT: fresh TXT values are needed before each renewal."
   fi
-  say "  Full chain: $out/fullchain.pem"
-  say "  Private key: $out/privkey.pem"
   warn "If clients connect to NODE, configure TLS on the NODE as well."
 }
 
@@ -304,15 +379,13 @@ finish_manual() {
     fail "DNS verification failed. Verify TXT records and propagation."
     return 1
   fi
+  local previous
+  previous="$(cert_dir_for_domain)"
+  ask_cert_path "$previous" || return
+  check_destination "$previous" || return
   choose_reload || return
-  local out="$CERT_BASE/$DOMAIN"
-  install -d -m 700 "$out"
-  "$ACME" --install-cert -d "$DOMAIN" --key-file "$out/privkey.pem" \
-    --fullchain-file "$out/fullchain.pem" --reloadcmd "$RELOAD_CMD" || return 1
-  chmod 600 "$out/privkey.pem"
-  printf '%s\n' manual > "$out/.mode"
-  chmod 600 "$out/.mode"
-  good "Certificate installed: $DOMAIN"
+  install_cert_files manual || return 1
+  good "Manual TXT certificate installed for $DOMAIN"
   warn "Manual TXT certificates do NOT auto-renew; create fresh TXT records at renewal."
 }
 
