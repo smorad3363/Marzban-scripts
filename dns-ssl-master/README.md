@@ -45,12 +45,30 @@ After adding the records and waiting for propagation, return to the menu and use
 4. Force renewal (intended for automatic DNS API mode)
 5. Cron status and logs
 6. Finish pending manual TXT challenge
+7. Change certificate save directory
 0. Exit
 
-## Certificate paths
+## Certificate files for Marzban / VLESS TCP TLS
 
-    /etc/ssl/master-dns-ssl/<domain>/fullchain.pem
-    /etc/ssl/master-dns-ssl/<domain>/privkey.pem
+During issuance you are prompted for a destination directory. Press Enter for the default, a **per-domain folder**:
+
+    /var/lib/marzban/certs/<domain>/
+
+The script saves exactly these two files:
+
+    /var/lib/marzban/certs/<domain>/fullchain.pem
+    /var/lib/marzban/certs/<domain>/key.pem
+
+For example, the domain german-hetzner.drwrdoh.org has these paths:
+
+    /var/lib/marzban/certs/german-hetzner.drwrdoh.org/fullchain.pem
+    /var/lib/marzban/certs/german-hetzner.drwrdoh.org/key.pem
+
+Use fullchain.pem as **certificateFile**, key.pem as **keyFile** in Xray TLS settings. The menu prints both absolute paths after issuance, in "List Certificates" and in "View Certificate Details".
+
+To choose a different path, enter an absolute directory when prompted. acme.sh persists the selected install paths for automatic DNS API renewals. Option 7 lets you change an already-installed certificate's destination without reissuing it; old files are deliberately left untouched. Previous versions' installations under /etc/ssl/master-dns-ssl/<domain> can also be migrated with option 7.
+
+The installed certificate destination and renewal method are recorded in root-only files under /etc/master-dns-ssl/domains.
 
 Installed launcher: /usr/local/sbin/master-dns-ssl.
 
