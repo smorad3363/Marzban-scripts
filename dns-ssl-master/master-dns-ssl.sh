@@ -390,8 +390,10 @@ issue_cert() {
   fi
 
   say ""
-  say "STEP 1/2: Add BOTH TXT values shown below in your DNS panel."
-  say "You can keep the same TXT record name with multiple values."
+  say "STEP 1/2: Create the TXT records shown below."
+  if (( WILDCARD )); then
+    say "For root + wildcard, you normally need TWO TXT values at the same DNS name."
+  fi
   say "──────────────────────────────────────────────────"
   local log rc=0
   log="$(mktemp)"
