@@ -4,6 +4,9 @@ on:
   push:
     paths:
       - 'dns-ssl-master/**'
+      - 'AGENTS.md'
+      - '.github/copilot-instructions.md'
+      - '.github/CODEOWNERS'
       - '.github/workflows/master-dns-ssl-check.yml'
   workflow_dispatch:
 
@@ -33,6 +36,8 @@ jobs:
           test -x "$tmp/install/acme.sh"
           test -f "$tmp/install/dnsapi/dns_cf.sh"
           (cd / && "$tmp/install/acme.sh" --version)
+      - name: Lock installer and public install/update command
+        run: bash dns-ssl-master/tests/test-installer-contract.sh
       - name: Test readable TXT records and certificate paths
         run: bash dns-ssl-master/tests/test-output.sh
       - name: Check for unsafe legacy HTTP validation
