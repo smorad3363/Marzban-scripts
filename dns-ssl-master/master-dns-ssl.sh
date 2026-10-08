@@ -280,9 +280,15 @@ ensure_acme() {
     fi
     local install_opts=(--install --nocron --home "$ACME_HOME")
     if [[ -n "$ACCOUNT_EMAIL" ]]; then install_opts+=(--accountemail "$ACCOUNT_EMAIL"); fi
-    if ! "$tmp/src/acme.sh" "${install_opts[@]}"; then
+    # acme.sh --install copies ./acme.sh, so it MUST run inside its source directory.
+    if ! (cd "$tmp/src" && ./acme.sh "${install_opts[@]}"); then
       rm -rf "$tmp"
-      fail "acme.sh installation failed."
+      fail "acme.sh installation failed. Check output above."
+      return 1
+    fi
+    if [[ ! -x "$ACME" ]]; then
+      rm -rf "$tmp"
+      fail "acme.sh did not install to $ACME."
       return 1
     fi
     rm -rf "$tmp"
