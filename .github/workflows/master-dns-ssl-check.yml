@@ -33,6 +33,8 @@ jobs:
           test -x "$tmp/install/acme.sh"
           test -f "$tmp/install/dnsapi/dns_cf.sh"
           (cd / && "$tmp/install/acme.sh" --version)
+      - name: Test readable TXT records and certificate paths
+        run: bash dns-ssl-master/tests/test-output.sh
       - name: Check for unsafe legacy HTTP validation
         run: |
           ! grep -E -- '--standalone|--webroot|--nginx' dns-ssl-master/master-dns-ssl.sh
