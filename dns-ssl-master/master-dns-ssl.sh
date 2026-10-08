@@ -8,6 +8,8 @@ ACME="$ACME_HOME/acme.sh"
 CERT_BASE="/var/lib/marzban/certs"
 LEGACY_BASE="/etc/ssl/master-dns-ssl"
 STATE_DIR="/etc/master-dns-ssl/domains"
+SETTINGS_DIR="/etc/master-dns-ssl/settings"
+PENDING_FILE="/etc/master-dns-ssl/pending-domain"
 CRON_FILE="/etc/cron.d/master-dns-ssl"
 
 if [[ -t 1 ]]; then
@@ -65,14 +67,96 @@ ask_domain() {
   fi
 }
 
-ask_email() {
-  read -r -p "Let's Encrypt account email: " EMAIL
-  if [[ ! "$EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
-    fail "Invalid email."
-    return 1
+# Settings are only asked for in the Advanced menu.
+load_settings() {
+  local v
+  DEFAULT_BASE="$CERT_BASE"
+  RELOAD_CMD=":"
+  ACCOUNT_EMAIL=""
+  WILDCARD=1
+  if [[ -f "$SETTINGS_DIR/base" ]]; then
+    IFS= read -r v < "$SETTINGS_DIR/base" || true
+    if [[ "$v" == /* && "$v" != "/" ]]; then DEFAULT_BASE="$v"; fi
+  fi
+  if [[ -f "$SETTINGS_DIR/reload" ]]; then
+    IFS= read -r v < "$SETTINGS_DIR/reload" || true
+    if [[ -n "$v" ]]; then RELOAD_CMD="$v"; fi
+  fi
+  if [[ -f "$SETTINGS_DIR/email" ]]; then
+    IFS= read -r ACCOUNT_EMAIL < "$SETTINGS_DIR/email" || true
+  fi
+  if [[ -f "$SETTINGS_DIR/wildcard" ]]; then
+    IFS= read -r v < "$SETTINGS_DIR/wildcard" || true
+    [[ "$v" == 0 ]] && WILDCARD=0
   fi
 }
-
+save_setting() {
+  local file="$1" value="$2"
+  install -d -m 700 "$SETTINGS_DIR"
+  printf '%s\n' "$value" > "$SETTINGS_DIR/$file"
+  chmod 600 "$SETTINGS_DIR/$file"
+}
+valid_dir() {
+  local p="$1"
+  [[ "$p" == /* && "$p" != "/" && "$p" != */../* &&
+     "$p" != */./* && "$p" != */.. && "$p" != */. &&
+     "$p" != *$'\n'* && "$p" != *$'\r'* ]]
+}
+show_settings() {
+  load_settings
+  say "  Default cert parent: $DEFAULT_BASE"
+  say "  Wildcard: $( ((WILDCARD)) && printf 'yes' || printf 'no')"
+  say "  Reload command: $RELOAD_CMD"
+  say "  Account email: ${ACCOUNT_EMAIL:-not set (optional)}"
+}
+settings_menu() {
+  local opt value
+  while true; do
+    banner
+    say "╭─ Advanced settings (optional) ────────────────────╮"
+    show_settings
+    say ""
+    say "  1) Default certificate parent directory"
+    say "  2) Default post-renew reload action"
+    say "  3) Optional ACME account email (real email recommended)"
+    say "  4) Toggle root + wildcard vs root only"
+    say "  0) Back"
+    read -r -p "Choice [0-4]: " opt || return 0
+    case "$opt" in
+      1)
+        read -r -p "Parent directory [$DEFAULT_BASE]: " value
+        if [[ -n "$value" ]]; then
+          if valid_dir "$value"; then
+            save_setting base "${value%/}"
+            good "Default parent saved. Domain subdirectory is created automatically."
+          else
+            fail "Enter a valid absolute directory."
+          fi
+        fi
+        pause ;;
+      2)
+        choose_reload || { pause; continue; }
+        save_setting reload "$RELOAD_CMD"
+        good "Saved for future certificate installs."
+        pause ;;
+      3)
+        read -r -p "Real email, or blank to disable: " value
+        if [[ -z "$value" || "$value" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+          save_setting email "$value"
+          good "Email setting saved (used when acme.sh is newly installed)."
+        else
+          fail "Invalid email."
+        fi
+        pause ;;
+      4)
+        if (( WILDCARD )); then save_setting wildcard 0; else save_setting wildcard 1; fi
+        good "Wildcard selection updated."
+        pause ;;
+      0) return 0 ;;
+      *) warn "Choose 0-4."; pause ;;
+    esac
+  done
+}
 
 cert_dir_for_domain() {
   local saved=""
@@ -87,7 +171,7 @@ cert_dir_for_domain() {
   if [[ -f "$LEGACY_BASE/$DOMAIN/fullchain.pem" ]]; then
     printf '%s\n' "$LEGACY_BASE/$DOMAIN"
   else
-    printf '%s\n' "$CERT_BASE/$DOMAIN"
+    printf '%s\n' "$DEFAULT_BASE/$DOMAIN"
   fi
 }
 
@@ -102,7 +186,7 @@ cert_mode_for_domain() {
 }
 
 ask_cert_path() {
-  local suggested="${1:-$CERT_BASE/$DOMAIN}" entered
+  local suggested="${1:-$DEFAULT_BASE/$DOMAIN}" entered
   say ""
   say "Where should fullchain.pem and key.pem be saved?"
   read -r -p "Certificate directory [$suggested]: " entered
@@ -194,7 +278,9 @@ ensure_acme() {
       fail "Could not download acme.sh."
       return 1
     fi
-    if ! "$tmp/src/acme.sh" --install --nocron --home "$ACME_HOME" --accountemail "$EMAIL"; then
+    local install_opts=(--install --nocron --home "$ACME_HOME")
+    if [[ -n "$ACCOUNT_EMAIL" ]]; then install_opts+=(--accountemail "$ACCOUNT_EMAIL"); fi
+    if ! "$tmp/src/acme.sh" "${install_opts[@]}"; then
       rm -rf "$tmp"
       fail "acme.sh installation failed."
       return 1
