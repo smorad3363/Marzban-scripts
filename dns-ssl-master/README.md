@@ -1,85 +1,85 @@
-# Master DNS SSL — zero inbound ports, simple interactive SSL
+# Master DNS SSL — Quick SSL issuance on a Master server
 
-Install Let's Encrypt certificates on a MASTER VPS using DNS-01, even when the hostname points to a different NODE IP. No inbound 80/443 required for issuance.
+An interactive manager for Let's Encrypt DNS-01 certificates. Your hostname may point to a separate NODE IP; no inbound ports 80/443 are needed **to issue or renew certificates**.
 
-## Install with one command (Ubuntu/Debian)
+## Install or update (Ubuntu/Debian)
 
     curl -fsSL https://raw.githubusercontent.com/smorad3363/Marzban-scripts/master/dns-ssl-master/install.sh -o /tmp/master-dns-ssl-install.sh && sudo bash /tmp/master-dns-ssl-install.sh
 
-After installation:
+Open menu again:
 
     sudo master-dns-ssl
 
-## Two easy modes
+## Quick mode: only the essential questions
 
-### 1. Cloudflare auto — recommended for unattended cron renewal
+**Option 1: Manual DNS TXT SSL**
+1. Enter a domain name once, like dfsah.org (without https:// or *.).
+2. By default the program requests both dfsah.org and *.dfsah.org, creates the TXT challenges and displays all needed values.
+3. Create BOTH TXT values in your DNS panel (often two records with the same _acme-challenge.dfsah.org name).
+4. Once publicly propagated, press Enter. If you want to finish later, type q; next time simply use menu option 6. The manager remembers the pending domain, so you don't need to retype it.
 
-Enter your domain, email and Cloudflare API Token (masked). You do NOT have to look up or enter a Zone ID. acme.sh detects the zone automatically.
+No email, wildcard, reload, folder, mode or initial confirmation prompts. **Manual TXT certificates DO NOT automatically renew**. New TXT values are required for every renewal. Issuing DNS TXT challenges does not change DNS A/AAAA records.
 
-Token permissions restricted to the correct zone:
+**Option 2: Cloudflare auto SSL**
+1. Enter a domain.
+2. If you have never used this token before, enter a Cloudflare API Token (input hidden). Zone/DNS/Edit and Zone/Zone/Read permissions are required for the zone.
+3. The manager issues root + wildcard SSL and sets a daily ACME renewal check using cron (03:23 server time).
 
-- Zone / DNS / Edit
-- Zone / Zone / Read
+Zone ID is not requested, and an existing saved API Token is automatically reused. acme.sh persists the certificate file destinations and renewal/reload hooks for future renewals.
 
-The script gets a Let's Encrypt certificate using dns_cf, copies it to the install path, and configures a daily renewal check at 03:23 server time. No manual DNS records or changing A/AAAA records. A successful renewal triggers the configured reload command.
+For accounts requiring a different DNS-zone token, configure the correct token in acme.sh's protected credential configuration before issuance; different zone permissions can cause the reused credential to fail.
 
-### 2. Manual TXT — simplest for one-time issuance
+## Defaults
 
-No Cloudflare API credentials are required. The script prints the DNS TXT record(s), and you add them in your DNS panel manually. This can work with other DNS providers too.
+- Domain + wildcard: ON
+- Certificate directory: /var/lib/marzban/certs/<domain>/
+- Certificate: /var/lib/marzban/certs/<domain>/fullchain.pem
+- Private key: /var/lib/marzban/certs/<domain>/key.pem
+- Service reload on renewal: OFF (configure if needed)
+- Account email: NOT required (rather than inventing a fake email)
+- ACME CA: Let's Encrypt
+- Incoming ports for DNS-01 issuance: NONE
 
-For example, to cover the hostname german-hetzner.drwrdoh.org and its wildcard *.german-hetzner.drwrdoh.org, validation TXT records appear under:
+If an acme.sh account already exists, its account contact is retained.
 
-    _acme-challenge.german-hetzner.drwrdoh.org
+For example:
 
-If both hostname and wildcard were selected, two TXT values at the same record name may be required. Keep both TXT values until validation succeeds.
+    /var/lib/marzban/certs/dfsah.org/fullchain.pem
+    /var/lib/marzban/certs/dfsah.org/key.pem
 
-After adding the records and waiting for propagation, return to the menu and use option 6 to finish verification if you closed the initial prompt.
+Both file paths are displayed after installation, in "List certificates", and in "Certificate details". Use fullchain.pem as the Xray TLS certificateFile, key.pem as the keyFile. If Xray runs on a NODE, the certificate must also reach that server, which is separate from issuance on MASTER.
 
-**Manual TXT mode cannot automatically renew with cron.** DNS-01 values are different at each issuance or renewal. Use automatic Cloudflare API mode for uninterrupted renewals.
+## Menu
 
-## Manager menu
-
-1. Issue SSL (Cloudflare automatic / manual TXT)
-2. List certificates
-3. Inspect certificate
-4. Force renewal (intended for automatic DNS API mode)
-5. Cron status and logs
-6. Finish pending manual TXT challenge
-7. Change certificate save directory
+1. Manual TXT SSL (default root + wildcard)
+2. Cloudflare automatic SSL with cron renewal
+3. List certificates and paths
+4. Certificate details and paths
+5. Force-renew an API-issued certificate
+6. Complete pending manual TXT challenge without retyping the domain
+7. Cron status and logs
+8. Advanced Settings
+9. Change existing certificate directory
 0. Exit
 
-## Certificate files for Marzban / VLESS TCP TLS
+## Advanced Settings (option 8)
 
-During issuance you are prompted for a destination directory. Press Enter for the default, a **per-domain folder**:
+- Change default base directory; every new hostname still gets a distinct subfolder.
+- Configure a reload command for future installs (e.g., Nginx reload, Docker restart, custom).
+- Set an **optional real** Let's Encrypt account email (used for new installations of acme.sh).
+- Toggle wildcard coverage off if you want only the root domain.
 
-    /var/lib/marzban/certs/<domain>/
+Existing installed certificates are not rewritten when advanced settings change. Use option 9 to reinstall an existing certificate to a new destination and apply the current reload choice.
 
-The script saves exactly these two files:
+For existing certificates issued with older versions, the manager continues to recognize /etc/ssl/master-dns-ssl/<domain> and can help move them.
 
-    /var/lib/marzban/certs/<domain>/fullchain.pem
-    /var/lib/marzban/certs/<domain>/key.pem
+## Security and limits
 
-For example, the domain german-hetzner.drwrdoh.org has these paths:
+- Manual TXT remains manual at each renewal. Cron does not replace the human TXT changes.
+- Cloudflare credentials are stored in acme.sh's root-only configuration under /root/.acme.sh for unattended renewals. Never disclose them.
+- Advanced custom reload commands run as root; enter only trusted commands.
+- Service TLS requires its own open port(s). DNS-01 certificate issuance does not.
+- Certificate files belong to the master host until you explicitly configure the actual TLS endpoint (e.g., Xray/Marzban or NODE) to use them.
+- Always review code before executing a script from the internet as root.
 
-    /var/lib/marzban/certs/german-hetzner.drwrdoh.org/fullchain.pem
-    /var/lib/marzban/certs/german-hetzner.drwrdoh.org/key.pem
-
-Use fullchain.pem as **certificateFile**, key.pem as **keyFile** in Xray TLS settings. The menu prints both absolute paths after issuance, in "List Certificates" and in "View Certificate Details".
-
-To choose a different path, enter an absolute directory when prompted. acme.sh persists the selected install paths for automatic DNS API renewals. Option 7 lets you change an already-installed certificate's destination without reissuing it; old files are deliberately left untouched. Previous versions' installations under /etc/ssl/master-dns-ssl/<domain> can also be migrated with option 7.
-
-The installed certificate destination and renewal method are recorded in root-only files under /etc/master-dns-ssl/domains.
-
-Installed launcher: /usr/local/sbin/master-dns-ssl.
-
-The Cloudflare API token is stored by acme.sh in root-only files under /root/.acme.sh; never commit or share these files.
-
-## Notes
-
-- The master certificate does not automatically configure TLS on a node that terminates client connections.
-- No inbound port is required for DNS-01 issuance, but your application may still need publicly accessible ports.
-- Choose a reload hook (Nginx, Caddy, Marzban, custom) for servers to read the new certificate automatically after renewal.
-- Outbound HTTPS and working DNS are still necessary.
-- Review internet-fetched code before running it with root privileges.
-
-Based on official acme.sh: https://github.com/acmesh-official/acme.sh
+Uses the official acme.sh project: https://github.com/acmesh-official/acme.sh
