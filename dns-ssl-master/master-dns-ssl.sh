@@ -325,157 +325,147 @@ choose_reload() {
   esac
 }
 
+# Issue without redundant questions: only domain, and TXT verification when manual.
 issue_cert() {
+  local mode="$1" existing manual_reissue=0
+  load_settings
   banner
-  say "╭─ Issue a new certificate ─────────────────────────╮"
-  ask_domain || return
-  local manual_reissue=0 existing
-  existing="$(cert_dir_for_domain)"
-  if [[ -f "$existing/fullchain.pem" ]]; then
-    if [[ "$(cert_mode_for_domain)" == manual ]]; then
-      warn "This domain uses MANUAL TXT. New TXT records are required to renew."
-      read -r -p "Start manual renewal with fresh TXT values? [y/N]: " yes
-      [[ "$yes" == [yY] ]] || return 0
-      manual_reissue=1
-    else
-      warn "Already installed: $existing"
-      say "Use option 4 to renew, or option 7 to change certificate paths."
-      return
-    fi
-  fi
-  ask_email || return
-
-  say ""
-  say "How do you want to prove domain ownership?"
-  say "  1) Cloudflare auto (one API Token, NO Zone ID) - renews automatically"
-  say "  2) Manual DNS TXT (NO API Token) - renew each time manually"
-  local mode
-  read -r -p "Choose [1/2]: " mode
-  if [[ "$mode" != 1 && "$mode" != 2 ]]; then
-    fail "Choose 1 or 2."
-    return 1
-  fi
-  if (( manual_reissue == 1 )) && [[ "$mode" != 2 ]]; then
-    fail "This is a manual TXT renewal. Choose option 2."
-    return 1
-  fi
-
-  local wildcard
-  read -r -p "Also include *.$DOMAIN (wildcard)? [Y/n]: " wildcard
-  local args=(-d "$DOMAIN")
-  if [[ "$wildcard" != [nN] ]]; then
-    args+=(-d "*.$DOMAIN")
-  fi
-  ask_cert_path "$existing" || return
-  check_destination "$existing" || return
-  choose_reload || return
-
-  if [[ "$mode" == 1 ]]; then
-    say ""
-    say "Cloudflare API Token permission: Zone/DNS/Edit and Zone/Zone/Read."
-    say "Restrict token scope to the DNS zone containing $DOMAIN."
-    read -r -s -p "Cloudflare API Token (hidden): " CF_Token
-    printf '\n'
-    if [[ -z "$CF_Token" ]]; then
-      fail "API Token cannot be empty."
-      return 1
-    fi
-    warn "acme.sh stores DNS credentials in /root/.acme.sh for unattended renewal."
+  if [[ "$mode" == manual ]]; then
+    say "╭─ Manual TXT SSL: root + wildcard ─────────────────╮"
   else
-    say ""
-    warn "MANUAL TXT: Every renewal needs NEW TXT records. Cron CANNOT renew this certificate automatically."
-    say "The next command prints TXT names and values; copy ALL of them to your DNS provider."
-    say "If you requested the domain + wildcard, you may need TWO TXT values with the same record name."
+    say "╭─ Cloudflare automatic SSL: root + wildcard ───────╮"
+  fi
+  ask_domain || return
+  existing="$(cert_dir_for_domain)"
+  CERT_DIR="$existing"
+
+  if [[ -f "$existing/fullchain.pem" ]]; then
+    if [[ "$mode" == manual && "$(cert_mode_for_domain)" == manual ]]; then
+      manual_reissue=1
+      warn "Renewing existing manual TXT certificate; new TXT values are required."
+    else
+      warn "Certificate already exists at $existing"
+      say "Use the certificate menu to view or renew it."
+      return 0
+    fi
   fi
 
-  say "No A/AAAA change and no inbound port opening is needed."
-  local confirm
-  read -r -p "Continue? [y/N]: " confirm
-  [[ "$confirm" == [yY] ]] || { say "Cancelled."; return; }
+  local args=(-d "$DOMAIN")
+  if (( WILDCARD )); then args+=(-d "*.$DOMAIN"); fi
+  say "  Domains: $DOMAIN$( ((WILDCARD)) && printf ', *.%s' "$DOMAIN" || true)"
+  show_cert_paths "$CERT_DIR"
+  say "  No incoming ports or DNS A/AAAA changes required."
   ensure_acme || return 1
 
-  if [[ "$mode" == 1 ]]; then
-    # Let acme.sh discover Cloudflare Zone ID automatically.
-    export CF_Token
+  if [[ "$mode" == auto ]]; then
+    local reused_token=0
+    if [[ -f "$ACME_HOME/account.conf" ]] &&
+       grep -q '^SAVED_CF_Token=' "$ACME_HOME/account.conf"; then
+      good "Reusing Cloudflare API Token stored by acme.sh."
+      reused_token=1
+    else
+      say "Cloudflare token: Zone/DNS/Edit + Zone/Zone/Read for this zone."
+      read -r -s -p "Cloudflare API Token: " CF_Token
+      printf '\n'
+      if [[ -z "$CF_Token" ]]; then fail "API Token required."; return 1; fi
+      export CF_Token
+    fi
     unset CF_Zone_ID CF_Account_ID || true
     if ! "$ACME" --issue --server letsencrypt --dns dns_cf --keylength 2048 "${args[@]}"; then
-      unset CF_Token
-      fail "Issuance failed. Check Cloudflare permissions and outbound HTTPS/DNS."
+      unset CF_Token || true
+      fail "Issuance failed. Check DNS permissions and outward HTTPS access."
+      if (( reused_token )); then
+        warn "To use a different Cloudflare zone token, rerun with a token after clearing the old acme.sh token."
+      fi
       return 1
     fi
-    unset CF_Token
-  else
-    say ""
-    say "STEP 1: Generate manual challenge. Save the displayed TXT record(s)."
-    say "--------------------------------------------------------------------"
-    # Manual --issue normally exits before obtaining a cert; the operator
-    # must add the challenge TXT records and then complete with --renew.
-    local force_issue=()
-    if (( manual_reissue == 1 )); then force_issue=(--force); fi
-    "$ACME" --issue --server letsencrypt --dns --keylength 2048 \
-      "${args[@]}" "${force_issue[@]}" \
-      --yes-I-know-dns-manual-mode-enough-go-ahead-please || true
-    say "--------------------------------------------------------------------"
-    say ""
-    warn "Add the displayed TXT records in your authoritative DNS panel."
-    say "Wait until they are publicly visible (DNS propagation)."
-    say "TXT record name usually starts with _acme-challenge.$DOMAIN."
-    local proceed
-    read -r -p "I have created ALL TXT records and they have propagated. Verify now? [y/N]: " proceed
-    [[ "$proceed" == [yY] ]] || {
-      warn "Challenge remains pending. Select menu option 6 to finish once TXT is public."
-      return 0
-    }
-    say "STEP 2: Verify the existing manual DNS challenge."
-    local force_renew=()
-    if (( manual_reissue == 1 )); then force_renew=(--force); fi
-    if ! "$ACME" --renew --server letsencrypt -d "$DOMAIN" \
-      "${force_renew[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please; then
-      fail "Validation failed. Check TXT names/values and DNS propagation."
-      warn "Use the manual option again to generate fresh challenges if necessary."
-      return 1
-    fi
-  fi
-
-  if [[ "$mode" == 1 ]]; then
+    unset CF_Token || true
     install_cert_files auto || return 1
     ensure_cron
-    good "Automatic DNS API renewal enabled for $DOMAIN"
-  else
-    install_cert_files manual || return 1
-    warn "MANUAL TXT: fresh TXT values are needed before each renewal."
+    good "Automatic renewal enabled. Files will stay at the same paths."
+    if [[ "$RELOAD_CMD" == ":" ]]; then
+      warn "Reload is set to none. Set a reload hook in Advanced Settings if your service needs one."
+    fi
+    return 0
   fi
-  warn "If clients connect to NODE, configure TLS on the NODE as well."
+
+  say ""
+  say "STEP 1/2: Add BOTH TXT values shown below in your DNS panel."
+  say "You can keep the same TXT record name with multiple values."
+  say "──────────────────────────────────────────────────"
+  local log rc=0
+  log="$(mktemp)"
+  local force_issue=()
+  if (( manual_reissue )); then force_issue=(--force); fi
+  "$ACME" --issue --server letsencrypt --dns --keylength 2048 \
+    "${args[@]}" "${force_issue[@]}" \
+    --yes-I-know-dns-manual-mode-enough-go-ahead-please 2>&1 | tee "$log" || rc=$?
+  if (( rc != 0 )) && ! grep -Fq "Add the following TXT record" "$log"; then
+    rm -f "$log"
+    fail "Unable to prepare the DNS TXT challenge. Review errors above."
+    return 1
+  fi
+  rm -f "$log"
+
+  install -d -m 700 "$STATE_DIR"
+  printf '%s\n' "$DOMAIN" > "$PENDING_FILE"
+  chmod 600 "$PENDING_FILE"
+  say "──────────────────────────────────────────────────"
+  say ""
+  warn "WAIT for all TXT records to propagate before verifying."
+  local ready
+  read -r -p "TXT records ready? Press ENTER to verify, or q to finish later: " ready
+  if [[ "$ready" == [qQ] ]]; then
+    say "Saved pending challenge for $DOMAIN. Use menu option 6 later."
+    return 0
+  fi
+  complete_manual
+}
+
+complete_manual() {
+  load_settings
+  if [[ -f "$PENDING_FILE" ]]; then
+    IFS= read -r DOMAIN < "$PENDING_FILE" || true
+    valid_domain "$DOMAIN" || { fail "Invalid pending domain file."; return 1; }
+  else
+    warn "No saved pending domain from the current version."
+    ask_domain || return 1
+  fi
+
+  if [[ ! -x "$ACME" ]]; then
+    fail "acme.sh is not installed."
+    return 1
+  fi
+  say "STEP 2/2: Verifying TXT records for $DOMAIN"
+  local force_pending=()
+  if [[ "$(cert_mode_for_domain)" == manual ]]; then force_pending=(--force); fi
+  if ! "$ACME" --renew --server letsencrypt -d "$DOMAIN" \
+    "${force_pending[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please; then
+    fail "Validation failed. Keep the TXT values and check propagation."
+    say "Run menu option 6 when DNS is ready, using the SAME TXT values."
+    return 1
+  fi
+
+  CERT_DIR="$(cert_dir_for_domain)"
+  install_cert_files manual || return 1
+  if [[ -f "$PENDING_FILE" ]]; then
+    local pending
+    IFS= read -r pending < "$PENDING_FILE" || true
+    [[ "$pending" == "$DOMAIN" ]] && rm -f "$PENDING_FILE"
+  fi
+  warn "Manual DNS certificates require NEW TXT records for every renewal."
+  return 0
 }
 
 finish_manual() {
   banner
-  say "╭─ Complete pending manual TXT challenge ───────────╮"
-  ask_domain || return
-  if [[ ! -x "$ACME" ]]; then
-    fail "acme.sh is not installed. Start by choosing Issue SSL."
-    return 1
+  say "╭─ Finish pending TXT verification ────────────────╮"
+  if [[ -f "$PENDING_FILE" ]]; then
+    local pending
+    IFS= read -r pending < "$PENDING_FILE" || true
+    say "Pending domain: $pending (no need to type it again)"
   fi
-  say "All previously displayed _acme-challenge TXT records must be public."
-  read -r -p "I have added the TXT record(s). Continue? [y/N]: " proceed
-  [[ "$proceed" == [yY] ]] || return 0
-  local force_pending=()
-  if [[ "$(cert_mode_for_domain)" == manual ]]; then
-    force_pending=(--force)
-  fi
-  if ! "$ACME" --renew --server letsencrypt -d "$DOMAIN" \
-    "${force_pending[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please; then
-    fail "DNS verification failed. Verify TXT records and propagation."
-    return 1
-  fi
-  local previous
-  previous="$(cert_dir_for_domain)"
-  ask_cert_path "$previous" || return
-  check_destination "$previous" || return
-  choose_reload || return
-  install_cert_files manual || return 1
-  good "Manual TXT certificate installed for $DOMAIN"
-  warn "Manual TXT certificates do NOT auto-renew; create fresh TXT records at renewal."
+  complete_manual
 }
 
 list_certs() {
