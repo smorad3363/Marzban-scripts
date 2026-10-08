@@ -153,10 +153,19 @@ issue_cert() {
   banner
   say "╭─ Issue a new certificate ─────────────────────────╮"
   ask_domain || return
+  local manual_reissue=0
   if [[ -f "$CERT_BASE/$DOMAIN/fullchain.pem" ]]; then
-    warn "Already installed: $CERT_BASE/$DOMAIN"
-    say "Certificate already exists. Use the renew option."
-    return
+    if [[ -f "$CERT_BASE/$DOMAIN/.mode" ]] &&
+       [[ "$(cat "$CERT_BASE/$DOMAIN/.mode")" == manual ]]; then
+      warn "This domain uses MANUAL TXT. New TXT records are required to renew."
+      read -r -p "Start manual renewal with fresh TXT values? [y/N]: " yes
+      [[ "$yes" == [yY] ]] || return 0
+      manual_reissue=1
+    else
+      warn "Already installed: $CERT_BASE/$DOMAIN"
+      say "Use menu option 4 to renew an API-issued certificate."
+      return
+    fi
   fi
   ask_email || return
 
@@ -168,6 +177,10 @@ issue_cert() {
   read -r -p "Choose [1/2]: " mode
   if [[ "$mode" != 1 && "$mode" != 2 ]]; then
     fail "Choose 1 or 2."
+    return 1
+  fi
+  if (( manual_reissue == 1 )) && [[ "$mode" != 2 ]]; then
+    fail "This is a manual TXT renewal. Choose option 2."
     return 1
   fi
 
@@ -219,8 +232,11 @@ issue_cert() {
     say "--------------------------------------------------------------------"
     # Manual --issue normally exits before obtaining a cert; the operator
     # must add the challenge TXT records and then complete with --renew.
+    local force_issue=()
+    if (( manual_reissue == 1 )); then force_issue=(--force); fi
     "$ACME" --issue --server letsencrypt --dns --keylength 2048 \
-      "${args[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please || true
+      "${args[@]}" "${force_issue[@]}" \
+      --yes-I-know-dns-manual-mode-enough-go-ahead-please || true
     say "--------------------------------------------------------------------"
     say ""
     warn "Add the displayed TXT records in your authoritative DNS panel."
@@ -233,8 +249,10 @@ issue_cert() {
       return 0
     }
     say "STEP 2: Verify the existing manual DNS challenge."
+    local force_renew=()
+    if (( manual_reissue == 1 )); then force_renew=(--force); fi
     if ! "$ACME" --renew --server letsencrypt -d "$DOMAIN" \
-      --yes-I-know-dns-manual-mode-enough-go-ahead-please; then
+      "${force_renew[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please; then
       fail "Validation failed. Check TXT names/values and DNS propagation."
       warn "Use the manual option again to generate fresh challenges if necessary."
       return 1
@@ -250,9 +268,13 @@ issue_cert() {
   fi
   chmod 600 "$out/privkey.pem"
   if [[ "$mode" == 1 ]]; then
+    printf '%s\n' auto > "$out/.mode"
+    chmod 600 "$out/.mode"
     ensure_cron
     good "SSL installed with automatic cron renewal! $DOMAIN"
   else
+    printf '%s\n' manual > "$out/.mode"
+    chmod 600 "$out/.mode"
     good "SSL installed! $DOMAIN"
     warn "MANUAL MODE: update DNS TXT and renew manually before expiration."
   fi
@@ -272,8 +294,13 @@ finish_manual() {
   say "All previously displayed _acme-challenge TXT records must be public."
   read -r -p "I have added the TXT record(s). Continue? [y/N]: " proceed
   [[ "$proceed" == [yY] ]] || return 0
+  local force_pending=()
+  if [[ -f "$CERT_BASE/$DOMAIN/.mode" ]] &&
+     [[ "$(cat "$CERT_BASE/$DOMAIN/.mode")" == manual ]]; then
+    force_pending=(--force)
+  fi
   if ! "$ACME" --renew --server letsencrypt -d "$DOMAIN" \
-    --yes-I-know-dns-manual-mode-enough-go-ahead-please; then
+    "${force_pending[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please; then
     fail "DNS verification failed. Verify TXT records and propagation."
     return 1
   fi
@@ -283,6 +310,8 @@ finish_manual() {
   "$ACME" --install-cert -d "$DOMAIN" --key-file "$out/privkey.pem" \
     --fullchain-file "$out/fullchain.pem" --reloadcmd "$RELOAD_CMD" || return 1
   chmod 600 "$out/privkey.pem"
+  printf '%s\n' manual > "$out/.mode"
+  chmod 600 "$out/.mode"
   good "Certificate installed: $DOMAIN"
   warn "Manual TXT certificates do NOT auto-renew; create fresh TXT records at renewal."
 }
@@ -320,6 +349,11 @@ renew_now() {
   if [[ ! -x "$ACME" || ! -f "$CERT_BASE/$DOMAIN/fullchain.pem" ]]; then
     fail "This domain is not installed."
     return 1
+  fi
+  if [[ -f "$CERT_BASE/$DOMAIN/.mode" ]] &&
+     [[ "$(cat "$CERT_BASE/$DOMAIN/.mode")" == manual ]]; then
+    warn "Manual TXT cannot renew without new TXT values. Choose menu option 1, then manual TXT."
+    return 0
   fi
   warn "Force renewal may trigger Let's Encrypt rate limits. Use only when necessary."
   read -r -p "Force renewal now? [y/N]: " yes
