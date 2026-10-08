@@ -471,11 +471,20 @@ issue_cert() {
 
   if [[ -f "$existing/fullchain.pem" ]]; then
     if [[ "$mode" == manual && "$(cert_mode_for_domain)" == manual ]]; then
+      # Do not unnecessarily reissue (or reuse ACME auth) for a currently
+      # valid certificate; repeated issuance can hit rate limits.
+      if cert_is_current "$existing/fullchain.pem" "$DOMAIN" "$WILDCARD" &&
+         openssl x509 -in "$existing/fullchain.pem" -noout -checkend 2592000 >/dev/null 2>&1; then
+        good "Certificate is already installed and valid for at least 30 days."
+        show_cert_paths "$existing"
+        say "No new DNS TXT values are needed now."
+        return 0
+      fi
       manual_reissue=1
-      warn "Renewing existing manual TXT certificate; new TXT values are required."
+      warn "Certificate expires soon or needs replacing. New TXT records may be required."
     else
       warn "Certificate already exists at $existing"
-      say "Use the certificate menu to view or renew it."
+      show_cert_paths "$existing"
       return 0
     fi
   fi
