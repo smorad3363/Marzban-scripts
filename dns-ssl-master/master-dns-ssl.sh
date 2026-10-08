@@ -575,6 +575,7 @@ cron_status() {
 
 main() {
   local choice
+  load_settings
   while true; do
     banner
     printf '%s  1%s  Manual TXT SSL (root + wildcard) [simple]\n' "$BLUE" "$RESET"
