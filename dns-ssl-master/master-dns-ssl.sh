@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-MASTER_DNS_SSL_VERSION="2026.10.08-fix2"
+MASTER_DNS_SSL_VERSION="2026.10.08-ux3"
 ACME_HOME="/root/.acme.sh"
 ACME="$ACME_HOME/acme.sh"
 CERT_BASE="/var/lib/marzban/certs"
@@ -218,14 +218,78 @@ check_destination() {
 
 show_cert_paths() {
   local dir="$1" key="$1/key.pem"
-  # Files from earlier versions used privkey.pem instead of key.pem.
+  # Legacy certificates may have used privkey.pem.
   if [[ ! -f "$key" && -f "$dir/privkey.pem" ]]; then
     key="$dir/privkey.pem"
   fi
   say ""
-  printf '%sCertificate file (fullchain):%s %s\n' "$GREEN" "$RESET" "$dir/fullchain.pem"
-  printf '%sPrivate key file:%s %s\n' "$GREEN" "$RESET" "$key"
-  say "Use these paths in the certificateFile and keyFile fields for VLESS TCP TLS."
+  printf '%s\n' "============================================================"
+  say "  SSL CERTIFICATE PATHS  --  COPY ONE FULL LINE AT A TIME"
+  printf '%s\n' "============================================================"
+  say "CERTIFICATE FILE (certificateFile):"
+  printf '%s\n' "$dir/fullchain.pem"
+  say ""
+  say "PRIVATE KEY FILE (keyFile):"
+  printf '%s\n' "$key"
+  printf '%s\n' "============================================================"
+}
+
+# Print clean, copy-ready records from acme.sh manual mode.
+# Each saved record is a tab-separated FQDN and TXT value.
+show_txt_records() {
+  local records="$1" fqdn value count=0
+  if [[ ! -s "$records" ]]; then
+    warn "No TXT records saved to display."
+    return 1
+  fi
+  say ""
+  printf '%s\n' "============================================================"
+  say "   DNS TXT RECORDS FOR $DOMAIN  --  COPY THE VALUES BELOW"
+  printf '%s\n' "============================================================"
+  while IFS=$'\t' read -r fqdn value; do
+    [[ -n "$fqdn" && -n "$value" ]] || continue
+    count=$((count+1))
+    printf '\n%s\n' "------------------ TXT RECORD $count ------------------"
+    say "TYPE:"
+    say "TXT"
+    say "NAME (FULL DNS NAME):"
+    printf '%s\n' "$fqdn"
+    if [[ "$fqdn" == "_acme-challenge.$DOMAIN" ]]; then
+      say "CLOUDFLARE NAME (only if the DNS zone itself is $DOMAIN):"
+      say "_acme-challenge"
+    fi
+    say "CONTENT / TXT VALUE (copy the next line exactly):"
+    printf '%s\n' "$value"
+  done < "$records"
+  printf '\n%s\n' "============================================================"
+  if (( count > 1 )); then
+    say "IMPORTANT: Add ALL $count TXT values, even when the NAME is identical."
+  fi
+  say "Cloudflare: DNS > Records > Add record > TXT; TTL: Auto."
+  say "Do not alter the current A/AAAA records."
+  return 0
+}
+
+# Extract TXT values from ACME output without timestamps/repetitive prose.
+extract_txt_records() {
+  local logfile="$1" out="$2" n v i
+  local -a names=() values=()
+  mapfile -t names < <(sed -n "s/.*Domain: '\\([^']*\\)'.*/\\1/p" "$logfile")
+  mapfile -t values < <(sed -n "s/.*TXT value: '\\([^']*\\)'.*/\\1/p" "$logfile")
+  if (( ${#names[@]} == 0 || ${#names[@]} != ${#values[@]} )); then
+    return 1
+  fi
+  : > "$out"
+  chmod 600 "$out"
+  for ((i=0; i<${#names[@]}; i++)); do
+    n="${names[i]}" v="${values[i]}"
+    if [[ ! "$n" =~ ^_acme-challenge\.[a-zA-Z0-9.-]+$ ||
+          ! "$v" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+      rm -f "$out"
+      return 1
+    fi
+    printf '%s\t%s\n' "$n" "$v" >> "$out"
+  done
 }
 
 install_cert_files() {
@@ -374,7 +438,7 @@ issue_cert() {
   local args=(-d "$DOMAIN")
   if (( WILDCARD )); then args+=(-d "*.$DOMAIN"); fi
   say "  Domains: $DOMAIN$( ((WILDCARD)) && printf ', *.%s' "$DOMAIN" || true)"
-  show_cert_paths "$CERT_DIR"
+  say "  Save directory: $CERT_DIR"
   say "  No incoming ports or DNS A/AAAA changes required."
   ensure_acme || return 1
 
