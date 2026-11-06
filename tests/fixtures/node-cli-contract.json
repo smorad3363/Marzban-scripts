@@ -1,0 +1,8 @@
+{
+  "argument_parser": "6a31e1adbd96ed706ecd85667c3c5540ab073197602d7e4e7072d474ac345048",
+  "functions": {
+    "usage": "1cab29c0408e00c2ae75d7a6e2fe7e59b0c1347b2aac1f136f2ab2ead4a1b6c8",
+    "install_marzban_node": "7937d28509a871d69b5defce75b2753a9e05f39ea48ec370b902187be30fddc4",
+    "get_xray_core": "b28cdca6a62c4004e08841d9fe2572e3efee040485108f9cf1274eaab55d024d"
+  }
+}

@@ -56,6 +56,46 @@ sudo bash -c "$(curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/
 
 ## Installing Marzban-node
 
+The standard Marzban-node command keeps the upstream arguments, menus, instance
+names and management commands. Only the GitHub owner in the URL changes:
+
+```bash
+sudo bash -c "$(curl -sL https://github.com/smorad3363/Marzban-scripts/raw/master/marzban-node.sh)" @ install --name master
+```
+
+Use this same command on an existing `master` node to upgrade it in place. It
+preserves the certificate, ports, protocol, existing core binary, data and original
+`docker-compose.yml`; it does not ask for the certificate again. Keep the original
+instance name when upgrading another instance.
+
+The existing management commands remain available:
+
+```bash
+master status
+master logs
+master restart
+master update
+master core-update
+```
+
+The memory profile uses `GOGC=50` and normally assigns half the server's effective
+RAM to Go's soft memory budget. A usable existing budget is preserved. Idle
+connections, handshakes and buffers receive the same limits validated on the test
+nodes; traffic counters and account settings are retained. This is a soft Go
+budget, not a hard RSS cap. Diagnostics stay opt-in to avoid port collisions
+between instances. The selected image is pinned locally in
+`/opt/<name>/docker-compose.runtime.json`; `update` still pulls the original image
+tag from the unchanged base Compose file before preparing its runtime.
+
+The installer validates the runtime module and Compose configuration before
+recreating the node. Runtime backups are stored under
+`/var/lib/<name>/node-runtime-backups/`; a failed deployment restores the previous
+runtime and image. Unsupported future module versions are rejected before the
+running node is stopped. The master-side fixes tested separately are not applied
+to a different master by this node installer.
+
+### Optional multi-instance wrapper
+
 Use the multi-instance-safe installer from this fork:
 
 ```bash

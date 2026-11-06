@@ -56,6 +56,12 @@ fi
 DATA_DIR="/var/lib/$APP_NAME"
 DATA_MAIN_DIR="/var/lib/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+RUNTIME_COMPOSE_FILE="$APP_DIR/docker-compose.runtime.json"
+NODE_RUNTIME_STATE=""
+NODE_RUNTIME_PREPARED=false
+NODE_RUNTIME_COMMITTED=false
+NODE_RUNTIME_LOCK_FD=""
+NODE_SCRIPT_TEMP=""
 LAST_XRAY_CORES=5
 CERT_FILE="$DATA_DIR/cert.pem"
 FETCH_REPO="smorad3363/Marzban-scripts"
@@ -185,12 +191,36 @@ install_docker() {
 install_marzban_node_script() {
     colorized_echo blue "Installing marzban script"
     TARGET_PATH="/usr/local/bin/$APP_NAME"
-    curl -sSL $SCRIPT_URL -o $TARGET_PATH
+    stage_marzban_node_script
+    publish_marzban_node_script "$TARGET_PATH"
     
     sed -i "s/^APP_NAME=.*/APP_NAME=\"$APP_NAME\"/" $TARGET_PATH
     
     chmod 755 $TARGET_PATH
     colorized_echo green "Marzban-node script installed successfully at $TARGET_PATH"
+}
+
+stage_marzban_node_script() {
+    if [ -n "$NODE_SCRIPT_TEMP" ]; then
+        return
+    fi
+    NODE_SCRIPT_TEMP=$(mktemp)
+    trap cleanup_node_runtime EXIT
+    if ! curl -fsSL "$SCRIPT_URL" -o "$NODE_SCRIPT_TEMP" || [ ! -s "$NODE_SCRIPT_TEMP" ] || ! grep -q '^install_command() {' "$NODE_SCRIPT_TEMP" || ! bash -n "$NODE_SCRIPT_TEMP"; then
+        colorized_echo red "Failed to download a valid node management script."
+        return 1
+    fi
+}
+
+publish_marzban_node_script() {
+    local target="$1" candidate
+    candidate=$(mktemp "${target}.tmp.XXXXXX")
+    if ! install -m 755 "$NODE_SCRIPT_TEMP" "$candidate" || ! mv -f -- "$candidate" "$target"; then
+        rm -f -- "$candidate"
+        return 1
+    fi
+    rm -f -- "$NODE_SCRIPT_TEMP"
+    NODE_SCRIPT_TEMP=""
 }
 
 # Get a list of occupied ports
@@ -363,30 +393,374 @@ uninstall_marzban_node_data_files() {
     fi
 }
 
+node_compose() {
+    local files=(-f "$COMPOSE_FILE")
+    if [ -f "$RUNTIME_COMPOSE_FILE" ]; then
+        files+=(-f "$RUNTIME_COMPOSE_FILE")
+    fi
+    $COMPOSE "${files[@]}" "$@"
+}
+
+release_runtime_lock() {
+    if [ -n "$NODE_RUNTIME_LOCK_FD" ]; then
+        flock -u "$NODE_RUNTIME_LOCK_FD"
+        exec {NODE_RUNTIME_LOCK_FD}>&-
+        NODE_RUNTIME_LOCK_FD=""
+    fi
+}
+
+cleanup_node_runtime() {
+    if [ -n "$NODE_RUNTIME_STATE" ] && [ "$NODE_RUNTIME_COMMITTED" != true ]; then
+        if ! runtime_manager rollback "$NODE_RUNTIME_STATE" "$COMPOSE"; then
+            colorized_echo red "Automatic runtime recovery failed. Backup: $NODE_RUNTIME_STATE"
+        fi
+    fi
+    release_runtime_lock
+    if [ -n "$NODE_SCRIPT_TEMP" ]; then
+        rm -f -- "$NODE_SCRIPT_TEMP"
+    fi
+}
+
+prepare_node_runtime() {
+    if [ "$NODE_RUNTIME_PREPARED" = true ]; then
+        return
+    fi
+    detect_os
+    if ! command -v python3 >/dev/null 2>&1; then
+        install_package python3
+    fi
+    if ! command -v flock >/dev/null 2>&1; then
+        install_package util-linux
+    fi
+    exec {NODE_RUNTIME_LOCK_FD}>"$APP_DIR/.node-runtime.lock"
+    flock -x "$NODE_RUNTIME_LOCK_FD"
+    trap cleanup_node_runtime EXIT
+    NODE_RUNTIME_STATE=$(runtime_manager prepare "$COMPOSE_FILE" "$RUNTIME_COMPOSE_FILE" "$DATA_DIR" "$APP_NAME" "$COMPOSE")
+    NODE_RUNTIME_PREPARED=true
+}
+
+runtime_manager() {
+    python3 - "$@" <<'NODE_RUNTIME_PYTHON'
+# BEGIN EMBEDDED NODE RUNTIME MANAGER
+#!/usr/bin/env python3
+"""Embedded installer support; never reads or rewrites node certificates or users."""
+
+import ast
+import copy
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+ORIGINAL_MODULE_SHA256 = "12757c9b4f97095992f0b2dac5615e56317b047b382d34ef5a6e19484c22c83f"
+PATCHED_MODULE_SHA256 = "0656179bcb654f98ccd3b8d190f70d3bcb51a05d2dcc4979c8ac1e81e396ed37"
+
+RUNTIME_METHOD = '''    def _apply_runtime_limits(self):
+        if os.getenv("XRAY_NODE_MEMORY_PROFILE", "") == "balanced":
+            levels = self.setdefault("policy", {}).setdefault("levels", {})
+            levels.setdefault("0", {})
+            for values in levels.values():
+                for key, limit in (("handshake", 15), ("connIdle", 120), ("bufferSize", 64)):
+                    current = values.get(key)
+                    values[key] = min(current, limit) if isinstance(current, (int, float)) and current >= 0 else limit
+
+        listen = os.getenv("XRAY_NODE_METRICS_LISTEN", "")
+        if listen:
+            host, port = listen.rsplit(":", 1)
+            if host != "127.0.0.1" or not port.isdigit() or not 1 <= int(port) <= 65535:
+                raise ValueError("Node diagnostics must listen on an IPv4 loopback port")
+            metrics = self.setdefault("metrics", {})
+            metrics.setdefault("tag", "NodeDiagnostics")
+            metrics["listen"] = listen
+
+'''
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def patch_module(source):
+    digest = sha256(source.encode())
+    if digest == PATCHED_MODULE_SHA256:
+        return source
+    if digest != ORIGINAL_MODULE_SHA256:
+        raise RuntimeError("Unsupported node runtime module; existing services were not stopped")
+    edits = [
+        ("import atexit\n", "import atexit\nimport os\n"),
+        ("        self._apply_api()\n", "        self._apply_api()\n        self._apply_runtime_limits()\n"),
+        ("    def to_json(self, **json_kwargs):\n", RUNTIME_METHOD + "    def to_json(self, **json_kwargs):\n"),
+        (
+            "        atexit.register(lambda: self.stop() if self.started else None)\n",
+            "        for name in (\"GOGC\", \"GOMEMLIMIT\"):\n"
+            "            value = os.getenv(name)\n"
+            "            if value:\n"
+            "                self._env[name] = value\n\n"
+            "        atexit.register(lambda: self.stop() if self.started else None)\n",
+        ),
+    ]
+    for before, after in edits:
+        if source.count(before) != 1:
+            raise RuntimeError("Unexpected node module layout")
+        source = source.replace(before, after, 1)
+    ast.parse(source)
+    if sha256(source.encode()) != PATCHED_MODULE_SHA256:
+        raise RuntimeError("Node runtime patch checksum mismatch")
+    return source
+
+
+def memory_bytes(value):
+    match = re.fullmatch(r"([0-9]+)(B|KiB|MiB|GiB|TiB)", str(value))
+    if not match:
+        return 0
+    return int(match[1]) * {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4}[match[2]]
+
+
+def effective_memory():
+    total = int(next(line.split()[1] for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemTotal:"))) * 1024
+    for filename in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            value = Path(filename).read_text().strip()
+            if value.isdigit() and int(value) > 0:
+                total = min(total, int(value))
+        except OSError:
+            pass
+    return total
+
+
+def choose_budget(total, existing=None):
+    # Keep a previously configured, usable budget, including the tested 4/8 GiB budgets.
+    if 0 < memory_bytes(existing) <= total * 3 // 4:
+        return existing
+    return str(max(1, total // (2 * 1024**2))) + "MiB"
+
+
+def command(args, check=True, timeout=300):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    if check and result.returncode:
+        raise RuntimeError("Command failed: " + " ".join(args[:4]) + "\n" + result.stderr[-1500:])
+    return result
+
+
+def inspect_container(name):
+    result = command(["docker", "inspect", name], check=False, timeout=15)
+    return json.loads(result.stdout)[0] if result.returncode == 0 else None
+
+
+def atomic_write(path, content, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".node-runtime-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def environment(values):
+    if isinstance(values, dict):
+        return dict(values)
+    return dict(value.split("=", 1) for value in (values or []) if "=" in value)
+
+
+def runtime_override(previous, image, module, budget):
+    result = copy.deepcopy(previous)
+    service = result.setdefault("services", {}).setdefault("marzban-node", {})
+    service["image"] = image
+    env = environment(service.get("environment"))
+    env.update(GOGC="50", GOMEMLIMIT=budget, XRAY_NODE_MEMORY_PROFILE="balanced", XRAY_NODE_RUNTIME_SHA256=PATCHED_MODULE_SHA256)
+    service["environment"] = env
+    def target(value):
+        if isinstance(value, dict):
+            return value.get("target")
+        parts = value.split(":")
+        return parts[1] if len(parts) > 1 else parts[0]
+    service["volumes"] = [value for value in service.get("volumes", []) if target(value) != "/code/xray.py"]
+    service["volumes"].append({"type": "bind", "source": str(module), "target": "/code/xray.py", "read_only": True})
+    # Diagnostics remain opt-in; a fixed metrics port would break multiple instances.
+    return result
+
+
+def configured_image(compose, base, name):
+    probe = "node-runtime-probe-" + uuid.uuid4().hex[:12]
+    try:
+        command(compose + ["-f", str(base), "-p", name, "run", "-d", "--rm", "--no-deps", "-T", "--name", probe,
+                           "--entrypoint", "python", "marzban-node", "-c", "import time; time.sleep(60)"])
+        return inspect_container(probe)["Image"]
+    finally:
+        command(["docker", "rm", "-f", probe], check=False, timeout=15)
+
+
+def image_module(image):
+    result = command(["docker", "run", "--rm", "--network", "none", "--entrypoint", "python", image,
+                      "-c", "from pathlib import Path; print(Path('/code/xray.py').read_text(), end='')"])
+    return patch_module(result.stdout)
+
+
+def prepare(base, overlay, data, name, compose_string):
+    base, overlay, data = Path(base), Path(overlay), Path(data)
+    compose = shlex.split(compose_string)
+    initial_base_hash = sha256(base.read_bytes())
+    command(compose + ["-f", str(base), "-p", name, "config", "-q"])
+    old_container = inspect_container(name)
+    if old_container and old_container["Config"].get("Labels", {}).get("com.docker.compose.service") != "marzban-node":
+        raise RuntimeError("The container name belongs to another service")
+    previous = json.loads(overlay.read_text()) if overlay.exists() else {}
+    old_env = environment(old_container["Config"].get("Env")) if old_container else {}
+    previous_env = environment(previous.get("services", {}).get("marzban-node", {}).get("environment"))
+    budget = choose_budget(effective_memory(), previous_env.get("GOMEMLIMIT", old_env.get("GOMEMLIMIT")))
+    image = configured_image(compose, base, name)
+    source = image_module(image)
+    module = data / "node-runtime-patch" / "xray.py"
+    updated = runtime_override(previous, image, module, budget)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ-")
+    backups = data / "node-runtime-backups"
+    backups.mkdir(parents=True, exist_ok=True, mode=0o700)
+    backup = Path(tempfile.mkdtemp(prefix=stamp, dir=backups))
+    state = {"base": str(base), "overlay": str(overlay), "module": str(module), "name": name,
+             "old_image": old_container["Image"] if old_container else None,
+             "old_id": old_container["Id"] if old_container else None,
+             "old_restart_count": old_container["RestartCount"] if old_container else 0,
+             "was_running": bool(old_container and old_container["State"]["Running"]),
+             "budget": budget, "image": image, "backup": str(backup)}
+    for label, path in (("overlay", overlay), ("module", module)):
+        state[label + "_existed"] = path.exists()
+        if path.exists():
+            shutil.copy2(path, backup / label)
+    if sha256(base.read_bytes()) != initial_base_hash:
+        raise RuntimeError("Compose changed during preparation; retry with the new configuration")
+    statefile = backup / "state.json"
+    atomic_write(statefile, json.dumps(state, indent=2) + "\n")
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", dir=base.parent) as candidate:
+            json.dump(updated, candidate)
+            candidate.flush()
+            command(compose + ["-f", str(base), "-f", candidate.name, "-p", name, "config", "-q"])
+        atomic_write(module, source, 0o644)
+        atomic_write(overlay, json.dumps(updated, indent=2) + "\n")
+    except BaseException:
+        restore_files(state)
+        raise
+    print("Runtime profile: balanced; Go memory budget: " + budget, file=sys.stderr)
+    print(statefile)
+
+
+def restore_files(state):
+    for label in ("module", "overlay"):
+        target = Path(state[label])
+        if state[label + "_existed"]:
+            backup = Path(state["backup"]) / label
+            atomic_write(target, backup.read_text(), backup.stat().st_mode & 0o777)
+        else:
+            target.unlink(missing_ok=True)
+
+
+def rollback(statefile, compose_string):
+    state = json.loads(Path(statefile).read_text())
+    restore_files(state)
+    compose = shlex.split(compose_string)
+    if state["was_running"]:
+        recovery = Path(state["backup"]) / "recovery.json"
+        atomic_write(recovery, json.dumps({"services": {"marzban-node": {"image": state["old_image"]}}}))
+        files = ["-f", state["base"]]
+        if state["overlay_existed"]:
+            files += ["-f", state["overlay"]]
+        command(compose + files + ["-f", str(recovery), "-p", state["name"], "up", "-d", "--no-deps", "marzban-node"])
+    else:
+        current = inspect_container(state["name"])
+        if current and current["Config"].get("Labels", {}).get("com.docker.compose.service") == "marzban-node":
+            command(["docker", "rm", "-f", state["name"]])
+    print("Previous node runtime restored", file=sys.stderr)
+
+
+def verify(statefile):
+    state = json.loads(Path(statefile).read_text())
+    for _ in range(3):
+        time.sleep(1)
+        container = inspect_container(state["name"])
+        previous_restarts = state["old_restart_count"] if container and container["Id"] == state["old_id"] else 0
+        if not container or not container["State"]["Running"] or container["State"]["Restarting"] or container["RestartCount"] > previous_restarts:
+            raise RuntimeError("Node container did not remain running")
+        if container["Image"] != state["image"]:
+            raise RuntimeError("Running node image differs from the prepared runtime")
+        env = environment(container["Config"].get("Env"))
+        if any(env.get(key) != value for key, value in {"GOGC": "50", "GOMEMLIMIT": state["budget"], "XRAY_NODE_MEMORY_PROFILE": "balanced"}.items()):
+            raise RuntimeError("Node runtime environment was not applied")
+
+
+def main(args):
+    try:
+        if args[0] == "prepare":
+            prepare(*args[1:])
+        elif args[0] == "rollback":
+            rollback(*args[1:])
+        elif args[0] == "verify":
+            verify(*args[1:])
+        else:
+            raise RuntimeError("Unknown runtime operation")
+    except Exception as error:
+        print("Node runtime error: " + str(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+# END EMBEDDED NODE RUNTIME MANAGER
+NODE_RUNTIME_PYTHON
+}
+
 up_marzban_node() {
-    $COMPOSE -f $COMPOSE_FILE -p "$APP_NAME" up -d --remove-orphans
+    prepare_node_runtime
+    if node_compose -p "$APP_NAME" up -d --remove-orphans && runtime_manager verify "$NODE_RUNTIME_STATE"; then
+        NODE_RUNTIME_COMMITTED=true
+        release_runtime_lock
+        return
+    fi
+    runtime_manager rollback "$NODE_RUNTIME_STATE" "$COMPOSE"
+    NODE_RUNTIME_STATE=""
+    release_runtime_lock
+    return 1
 }
 
 down_marzban_node() {
-    $COMPOSE -f $COMPOSE_FILE -p "$APP_NAME" down
+    node_compose -p "$APP_NAME" down
 }
 
 show_marzban_node_logs() {
-    $COMPOSE -f $COMPOSE_FILE -p "$APP_NAME" logs
+    node_compose -p "$APP_NAME" logs
 }
 
 follow_marzban_node_logs() {
-    $COMPOSE -f $COMPOSE_FILE -p "$APP_NAME" logs -f
+    node_compose -p "$APP_NAME" logs -f
 }
 
 update_marzban_node_script() {
     colorized_echo blue "Updating marzban-node script"
-    curl -sSL $SCRIPT_URL | install -m 755 /dev/stdin /usr/local/bin/$APP_NAME
+    stage_marzban_node_script
+    publish_marzban_node_script "/usr/local/bin/$APP_NAME"
     colorized_echo green "marzban-node script updated successfully"
 }
 
 update_marzban_node() {
-    $COMPOSE -f $COMPOSE_FILE -p "$APP_NAME" pull
+    # Pull the configured tag, rather than the locally pinned runtime image.
+    $COMPOSE -f "$COMPOSE_FILE" -p "$APP_NAME" pull
 }
 
 is_marzban_node_installed() {
@@ -398,7 +772,7 @@ is_marzban_node_installed() {
 }
 
 is_marzban_node_up() {
-    if [ -z "$($COMPOSE -f $COMPOSE_FILE ps -q -a)" ]; then
+    if [ -z "$(node_compose ps -q -a)" ]; then
         return 1
     else
         return 0
@@ -407,6 +781,11 @@ is_marzban_node_up() {
 
 install_command() {
     check_running_as_root
+    # The original one-liner upgrades an existing instance without replacing its inputs.
+    if [ -f "$COMPOSE_FILE" ]; then
+        update_command
+        return
+    fi
     # Check if marzban is already installed
     if is_marzban_node_installed; then
         colorized_echo red "Marzban-node is already installed at $APP_DIR"
@@ -564,7 +943,7 @@ restart_command() {
     fi
     
     detect_compose
-    
+    prepare_node_runtime
     down_marzban_node
     up_marzban_node
     
@@ -589,7 +968,7 @@ status_command() {
     echo -n "Status: "
     colorized_echo green "Up"
     
-    json=$($COMPOSE -f $COMPOSE_FILE ps -a --format=json)
+    json=$(node_compose ps -a --format=json)
     services=$(echo "$json" | jq -r 'if type == "array" then .[] else . end | .Service')
     states=$(echo "$json" | jq -r 'if type == "array" then .[] else . end | .State')
     # Print out the service names and statuses
@@ -663,13 +1042,13 @@ update_command() {
     
     detect_compose
     
-    update_marzban_node_script
+    stage_marzban_node_script
     colorized_echo blue "Pulling latest version"
     update_marzban_node
     
     colorized_echo blue "Restarting Marzban-node services"
-    down_marzban_node
     up_marzban_node
+    update_marzban_node_script
     
     colorized_echo blue "Marzban-node updated successfully"
 }

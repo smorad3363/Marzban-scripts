@@ -1,0 +1,39 @@
+name: Marzban node installation and migration
+
+on:
+  push:
+    paths:
+      - marzban-node.sh
+      - node-runtime/**
+      - tools/embed-node-runtime.py
+      - tests/test_node_runtime*.py
+      - tests/fixtures/node-*
+      - .github/workflows/node-runtime-check.yml
+  pull_request:
+    paths:
+      - marzban-node.sh
+      - node-runtime/**
+      - tools/embed-node-runtime.py
+      - tests/test_node_runtime*.py
+      - tests/fixtures/node-*
+      - .github/workflows/node-runtime-check.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  node-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check syntax, unchanged CLI contract, preservation and rollback
+        run: python3 tests/test_node_runtime.py
+      - name: Install integration client dependencies
+        run: python3 -m pip install requests rpyc
+      - name: Test real fresh install, legacy REST and RPyC upgrades, and recovery
+        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE,PATH python3 tests/test_node_runtime_integration.py
