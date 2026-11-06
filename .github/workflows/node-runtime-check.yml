@@ -36,4 +36,4 @@ jobs:
       - name: Install integration client dependencies
         run: python3 -m pip install requests rpyc
       - name: Test real fresh install, legacy REST and RPyC upgrades, and recovery
-        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE,PATH python3 tests/test_node_runtime_integration.py
+        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE,LD_LIBRARY_PATH "$(command -v python3)" tests/test_node_runtime_integration.py
