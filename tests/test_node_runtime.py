@@ -117,7 +117,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(self.base.read_bytes(), self.original_base)
         self.assertEqual(self.cert.read_text(), "fixture client certificate: must survive\n")
         self.assertEqual(self.core.read_bytes(), b"keep the installed core binary")
-        self.assertEqual(overlay["services"]["marzban-node"]["environment"]["GOMEMLIMIT"], "4GiB")
+        self.assertEqual(overlay["services"]["marzban-node"]["environment"]["GOMEMLIMIT"], "6144MiB")
         self.assertEqual(json.loads(statefile.read_text())["old_image"], "sha256:old-image")
         self.assertFalse(any("down" in call for call in self.calls))
 
@@ -132,6 +132,14 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(node["environment"]["XRAY_NODE_METRICS_LISTEN"], "127.0.0.1:25443")
         self.assertIn("/custom:/custom:ro", node["volumes"])
         self.assertEqual(sum(isinstance(v, dict) and v.get("target") == "/code/xray.py" for v in node["volumes"]), 1)
+
+    def test_previous_50_percent_runtime_budget_is_upgraded(self):
+        self.overlay.write_text(json.dumps({"services": {"marzban-node": {"environment": {"GOMEMLIMIT": "4096MiB", "CUSTOM": "keep"}}}}))
+        self.prepare()
+        env = json.loads(self.overlay.read_text())["services"]["marzban-node"]["environment"]
+        self.assertEqual(env["GOMEMLIMIT"], "6144MiB")
+        self.assertEqual(env["CUSTOM"], "keep")
+        self.assertEqual(self.base.read_bytes(), self.original_base)
 
     def test_failure_restores_old_overlay_module_and_pins_the_previous_image(self):
         self.overlay.write_text('{"services":{}}\n')
@@ -167,14 +175,14 @@ class MigrationTests(unittest.TestCase):
 
 
 class ContractTests(unittest.TestCase):
-    def test_memory_budgets_scale_and_preserve_usable_existing_limits(self):
+    def test_memory_budgets_are_75_percent_at_different_server_sizes(self):
         for gib in (1, 2, 4, 8, 16, 32):
             total = gib * 1024**3
-            self.assertEqual(manager.memory_bytes(manager.choose_budget(total)), total // 2)
-        self.assertEqual(manager.choose_budget(8 * 1024**3, "4GiB"), "4GiB")
-        self.assertEqual(manager.choose_budget(16 * 1024**3, "8192MiB"), "8192MiB")
-        self.assertEqual(manager.choose_budget(2 * 1024**3, "8192MiB"), "1024MiB")
-        self.assertEqual(manager.choose_budget(8 * 1024**3, "off"), "4096MiB")
+            self.assertEqual(manager.memory_bytes(manager.choose_budget(total)), total * 3 // 4)
+        total = 7743 * 1024**2 + 512 * 1024
+        budget = manager.memory_bytes(manager.choose_budget(total))
+        self.assertLessEqual(budget, total * 3 // 4)
+        self.assertLess(total * 3 // 4 - budget, 1024**2)
 
     def test_original_cli_parser_menus_and_fresh_install_prompts_are_unchanged(self):
         script = (ROOT / "marzban-node.sh").read_text()

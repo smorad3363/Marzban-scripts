@@ -20,6 +20,7 @@ import uuid
 
 ORIGINAL_MODULE_SHA256 = "12757c9b4f97095992f0b2dac5615e56317b047b382d34ef5a6e19484c22c83f"
 PATCHED_MODULE_SHA256 = "0656179bcb654f98ccd3b8d190f70d3bcb51a05d2dcc4979c8ac1e81e396ed37"
+MEMORY_BUDGET_PERCENT = 75
 
 RUNTIME_METHOD = '''    def _apply_runtime_limits(self):
         if os.getenv("XRAY_NODE_MEMORY_PROFILE", "") == "balanced":
@@ -94,11 +95,9 @@ def effective_memory():
     return total
 
 
-def choose_budget(total, existing=None):
-    # Keep a previously configured, usable budget, including the tested 4/8 GiB budgets.
-    if 0 < memory_bytes(existing) <= total * 3 // 4:
-        return existing
-    return str(max(1, total // (2 * 1024**2))) + "MiB"
+def choose_budget(total):
+    # Recompute on upgrades too, so an old 50% budget cannot retain the old policy.
+    return str(max(1, total * MEMORY_BUDGET_PERCENT // (100 * 1024**2))) + "MiB"
 
 
 def command(args, check=True, timeout=300):
@@ -178,9 +177,7 @@ def prepare(base, overlay, data, name, compose_string):
     if old_container and old_container["Config"].get("Labels", {}).get("com.docker.compose.service") != "marzban-node":
         raise RuntimeError("The container name belongs to another service")
     previous = json.loads(overlay.read_text()) if overlay.exists() else {}
-    old_env = environment(old_container["Config"].get("Env")) if old_container else {}
-    previous_env = environment(previous.get("services", {}).get("marzban-node", {}).get("environment"))
-    budget = choose_budget(effective_memory(), previous_env.get("GOMEMLIMIT", old_env.get("GOMEMLIMIT")))
+    budget = choose_budget(effective_memory())
     image = configured_image(compose, base, name)
     source = image_module(image)
     module = data / "node-runtime-patch" / "xray.py"

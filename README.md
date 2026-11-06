@@ -78,8 +78,9 @@ master update
 master core-update
 ```
 
-The memory profile uses `GOGC=50` and normally assigns half the server's effective
-RAM to Go's soft memory budget. A usable existing budget is preserved. Idle
+The memory profile uses `GOGC=50` and assigns 75% of the server's effective
+RAM to Go's soft memory budget. Installation and upgrades recalculate this budget,
+including instances previously installed with the 50% policy. Idle
 connections, handshakes and buffers receive the same limits validated on the test
 nodes; traffic counters and account settings are retained. This is a soft Go
 budget, not a hard RSS cap. Diagnostics stay opt-in to avoid port collisions

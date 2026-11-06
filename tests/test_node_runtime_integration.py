@@ -2,6 +2,7 @@
 """Real Docker tests; only run on a disposable, empty GitHub Actions runner."""
 
 import hashlib
+import importlib.util
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -20,6 +21,9 @@ import rpyc
 
 
 ROOT = Path(__file__).resolve().parents[1]
+runtime_spec = importlib.util.spec_from_file_location("node_runtime", ROOT / "node-runtime/manager.py")
+runtime = importlib.util.module_from_spec(runtime_spec)
+runtime_spec.loader.exec_module(runtime)
 APP = Path("/opt/master")
 DATA = Path("/var/lib/master")
 SCRIPT = ROOT / "marzban-node.sh"
@@ -63,7 +67,7 @@ def wait_port(port, timeout=60):
     raise RuntimeError("Node port did not become ready: " + str(port))
 
 
-def check_runtime_and_data(cert, key, origin, protocol="rest", service_port=62050):
+def check_runtime_and_data(cert, key, origin, protocol="rest", service_port=62050, expected_percent=75):
     wait_port(service_port)
     socks_port = free_port()
     configuration = {"log": {"loglevel": "warning"}, "inbounds": [{"tag": "integration-users", "listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"auth": "noauth"}}], "outbounds": [{"protocol": "freedom"}], "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}}}}
@@ -94,7 +98,8 @@ def check_runtime_and_data(cert, key, origin, protocol="rest", service_port=6205
         wait_port(socks_port)
         child_env = json.loads(docker("exec", "master", "python", "-c", "import pathlib,json; p=next(p for p in pathlib.Path('/proc').glob('[0-9]*') if (p/'comm').exists() and (p/'comm').read_text().strip()=='xray'); print(json.dumps([x.decode() for x in (p/'environ').read_bytes().split(b'\\0') if x.startswith((b'GOGC=',b'GOMEMLIMIT='))]))"))
         assert "GOGC=50" in child_env, child_env
-        assert any(value.startswith("GOMEMLIMIT=") for value in child_env), child_env
+        expected_budget = str(runtime.effective_memory() * expected_percent // (100 * 1024**2)) + "MiB"
+        assert "GOMEMLIMIT=" + expected_budget in child_env, child_env
         body = run([REAL_CURL, "-fsS", "--noproxy", "", "--proxy", "socks5h://127.0.0.1:" + str(socks_port), "--max-time", "10", origin])
         assert hashlib.sha256(body).digest() == hashlib.sha256(PAYLOAD).digest()
     finally:
@@ -190,6 +195,19 @@ os.execv(os.environ['NODE_TEST_REAL_INSTALL'],[os.environ['NODE_TEST_REAL_INSTAL
                     raise RuntimeError(log.read()[-6000:])
             assert (APP / "docker-compose.runtime.json").is_file()
             check_runtime_and_data(cert, key, origin)
+
+            print("Testing an already-profiled node moving from 50% to 75%", flush=True)
+            overlay_path = APP / "docker-compose.runtime.json"
+            previous_runtime = json.loads(overlay_path.read_text())
+            previous_runtime["services"]["marzban-node"]["environment"]["GOMEMLIMIT"] = str(runtime.effective_memory() // (2 * 1024**2)) + "MiB"
+            overlay_path.write_text(json.dumps(previous_runtime, indent=2) + "\n")
+            docker("compose", "-f", str(APP / "docker-compose.yml"), "-f", str(overlay_path), "-p", "master", "up", "-d")
+            check_runtime_and_data(cert, key, origin, expected_percent=50)
+            before_policy_upgrade = snapshot()
+            run(["bash", str(SCRIPT), "install", "--name", "master"], input="", text=True, env=env)
+            assert snapshot() == before_policy_upgrade
+            check_runtime_and_data(cert, key, origin)
+            print("PASS: existing 50% runtime upgraded to 75% in the actual Xray process", flush=True)
 
             print("Creating a legacy node with custom ports, a pinned core and a sidecar", flush=True)
             base = json.loads(docker("compose", "-f", str(APP / "docker-compose.yml"), "config", "--format", "json"))
