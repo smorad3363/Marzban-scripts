@@ -79,7 +79,15 @@ def check_runtime_and_data(cert, key, origin, protocol="rest", service_port=6205
         response.raise_for_status()
         assert response.json()["started"]
     else:
-        peer = rpyc.ssl_connect("127.0.0.1", service_port, keyfile=str(key), certfile=str(cert), cert_reqs=ssl.CERT_NONE)
+        # Build the context explicitly: RPyC's convenience wrapper cannot disable
+        # hostname checking before CERT_NONE on recent Python versions.
+        from rpyc.core.stream import SocketStream
+        from rpyc.utils.factory import connect_stream
+        context = ssl.create_default_context(cafile=str(DATA / "ssl_cert.pem"))
+        context.check_hostname = False
+        context.load_cert_chain(str(cert), str(key))
+        raw = socket.create_connection(("127.0.0.1", service_port), timeout=10)
+        peer = connect_stream(SocketStream(context.wrap_socket(raw, server_hostname="Gozargah")))
         peer.root.start(json.dumps(configuration))
     try:
         wait_port(socks_port)
