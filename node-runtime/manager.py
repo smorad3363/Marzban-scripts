@@ -102,7 +102,7 @@ def choose_budget(total, existing=None):
 
 
 def command(args, check=True, timeout=300):
-    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout)
     if check and result.returncode:
         raise RuntimeError("Command failed: " + " ".join(args[:4]) + "\n" + result.stderr[-1500:])
     return result
@@ -224,7 +224,10 @@ def restore_files(state):
             backup = Path(state["backup"]) / label
             atomic_write(target, backup.read_text(), backup.stat().st_mode & 0o777)
         else:
-            target.unlink(missing_ok=True)
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def rollback(statefile, compose_string):

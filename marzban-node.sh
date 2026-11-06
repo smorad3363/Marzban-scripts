@@ -546,7 +546,7 @@ def choose_budget(total, existing=None):
 
 
 def command(args, check=True, timeout=300):
-    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout)
     if check and result.returncode:
         raise RuntimeError("Command failed: " + " ".join(args[:4]) + "\n" + result.stderr[-1500:])
     return result
@@ -668,7 +668,10 @@ def restore_files(state):
             backup = Path(state["backup"]) / label
             atomic_write(target, backup.read_text(), backup.stat().st_mode & 0o777)
         else:
-            target.unlink(missing_ok=True)
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def rollback(statefile, compose_string):
@@ -729,8 +732,11 @@ NODE_RUNTIME_PYTHON
 up_marzban_node() {
     prepare_node_runtime
     if node_compose -p "$APP_NAME" up -d --remove-orphans && runtime_manager verify "$NODE_RUNTIME_STATE"; then
-        NODE_RUNTIME_COMMITTED=true
-        release_runtime_lock
+        # Updates commit after publishing the staged CLI; a failed copy must roll back.
+        if [ -z "$NODE_SCRIPT_TEMP" ]; then
+            NODE_RUNTIME_COMMITTED=true
+            release_runtime_lock
+        fi
         return
     fi
     runtime_manager rollback "$NODE_RUNTIME_STATE" "$COMPOSE"
@@ -1049,6 +1055,8 @@ update_command() {
     colorized_echo blue "Restarting Marzban-node services"
     up_marzban_node
     update_marzban_node_script
+    NODE_RUNTIME_COMMITTED=true
+    release_runtime_lock
     
     colorized_echo blue "Marzban-node updated successfully"
 }

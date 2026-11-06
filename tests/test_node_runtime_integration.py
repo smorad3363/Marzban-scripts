@@ -25,6 +25,7 @@ DATA = Path("/var/lib/master")
 SCRIPT = ROOT / "marzban-node.sh"
 REAL_DOCKER = shutil.which("docker")
 REAL_CURL = shutil.which("curl")
+REAL_INSTALL = shutil.which("install")
 PAYLOAD = b"node-runtime-integration\n" * 50000
 
 
@@ -102,8 +103,9 @@ def check_runtime_and_data(cert, key, origin, protocol="rest", service_port=6205
     print("PASS: real " + protocol.upper() + " control, child Go environment and verified proxy payload", flush=True)
 
 
-def command_env(bin_dir, marker=None):
-    result = dict(os.environ, PATH=str(bin_dir) + ":" + os.environ["PATH"], TERM="xterm", NODE_TEST_SCRIPT=str(SCRIPT), NODE_TEST_REAL_DOCKER=REAL_DOCKER, NODE_TEST_REAL_CURL=REAL_CURL)
+def command_env(bin_dir, marker=None, cli_failure=False):
+    result = dict(os.environ, PATH=str(bin_dir) + ":" + os.environ["PATH"], TERM="xterm", NODE_TEST_SCRIPT=str(SCRIPT), NODE_TEST_REAL_DOCKER=REAL_DOCKER, NODE_TEST_REAL_CURL=REAL_CURL, NODE_TEST_REAL_INSTALL=REAL_INSTALL)
+    result["NODE_TEST_FAIL_CLI_COPY"] = "1" if cli_failure else "0"
     if marker:
         result["NODE_TEST_FAIL_UP"] = str(marker)
     else:
@@ -146,6 +148,13 @@ if marker and a and a[0]=='compose' and 'up' in a and not pathlib.Path(marker).e
  subprocess.run([os.environ['NODE_TEST_REAL_DOCKER'],'rm','-f','master'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
  print('Injected deployment failure after removing the old node',file=sys.stderr);sys.exit(42)
 os.execv(os.environ['NODE_TEST_REAL_DOCKER'],[os.environ['NODE_TEST_REAL_DOCKER']]+a)
+""")
+        (bin_dir / "install").write_text("""#!/usr/bin/env python3
+import os,sys
+a=sys.argv[1:]
+if os.environ.get('NODE_TEST_FAIL_CLI_COPY')=='1' and any(x.startswith('/usr/local/bin/master.tmp.') for x in a):
+ print('Injected CLI publication failure',file=sys.stderr);sys.exit(43)
+os.execv(os.environ['NODE_TEST_REAL_INSTALL'],[os.environ['NODE_TEST_REAL_INSTALL']]+a)
 """)
         for path in bin_dir.iterdir():
             path.chmod(0o755)
@@ -234,6 +243,18 @@ os.execv(os.environ['NODE_TEST_REAL_DOCKER'],[os.environ['NODE_TEST_REAL_DOCKER'
             assert snapshot() == before
             check_runtime_and_data(cert, key, origin, service_port=61050)
             print("PASS: failed deployment restored a working previous node", flush=True)
+
+            print("Testing recovery when publishing the updated CLI fails", flush=True)
+            previous_cli = Path("/usr/local/bin/master").read_bytes()
+            failure = subprocess.run(["bash", str(SCRIPT), "install", "--name", "master"], input="", text=True, env=command_env(bin_dir, cli_failure=True), capture_output=True, timeout=300)
+            assert failure.returncode != 0
+            assert "Previous node runtime restored" in failure.stderr
+            assert Path("/usr/local/bin/master").read_bytes() == previous_cli
+            assert (APP / "docker-compose.runtime.json").read_bytes() == old_overlay
+            assert (DATA / "node-runtime-patch/xray.py").read_bytes() == old_module
+            assert snapshot() == before
+            check_runtime_and_data(cert, key, origin, service_port=61050)
+            print("PASS: CLI publication failure preserved the previous command and working node", flush=True)
 
             print("Testing a legacy RPyC node without changing its protocol", flush=True)
             base["services"]["marzban-node"]["environment"]["SERVICE_PROTOCOL"] = "rpyc"
