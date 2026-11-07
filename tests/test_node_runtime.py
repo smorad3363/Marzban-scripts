@@ -99,7 +99,7 @@ class MigrationTests(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, "", "")
         for patch in [mock.patch.object(manager, "command", side_effect=run),
                       mock.patch.object(manager, "inspect_container", return_value=copy.deepcopy(self.old)),
-                      mock.patch.object(manager, "configured_image", return_value="sha256:new-image"),
+                      mock.patch.object(manager, "configured_image", return_value={"image": "sha256:new-image", "core": {"version": "Xray 26.3.27", "executable": "/var/lib/marzban-node/xray-core/xray"}}),
                       mock.patch.object(manager, "image_module", return_value=manager.patch_module(SOURCE)),
                       mock.patch.object(manager, "effective_memory", return_value=8 * 1024**3)]:
             patch.start()
@@ -166,7 +166,7 @@ class MigrationTests(unittest.TestCase):
     def test_concurrent_compose_edit_is_not_overwritten(self):
         def image(*args):
             self.base.write_text("a concurrent administrator edit\n")
-            return "sha256:new-image"
+            return {"image": "sha256:new-image", "core": {"version": "Xray 26.3.27"}}
         with mock.patch.object(manager, "configured_image", side_effect=image):
             with self.assertRaisesRegex(RuntimeError, "Compose changed"):
                 self.prepare()
@@ -175,6 +175,20 @@ class MigrationTests(unittest.TestCase):
 
 
 class ContractTests(unittest.TestCase):
+    def test_legacy_core_warning_does_not_claim_soft_memory_budget_fixes_ss2022(self):
+        for version in ("Xray 26.3.27 (Xray)", "Xray 26.9.9", "Xray 1.8.24", "custom core", ""):
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                manager.report_core_compatibility({"version": version}, "node2")
+            self.assertIn("Warning:", output.getvalue())
+            self.assertIn("node2 core-update", output.getvalue())
+            self.assertIn("existing executable preserved", output.getvalue())
+        for version in ("Xray 26.10.31 (Xray)", "Xray 26.11.1", "Xray 27.1.1"):
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                manager.report_core_compatibility({"version": version}, "node2")
+            self.assertNotIn("Warning:", output.getvalue())
+
     def test_memory_budgets_are_75_percent_at_different_server_sizes(self):
         for gib in (1, 2, 4, 8, 16, 32):
             total = gib * 1024**3

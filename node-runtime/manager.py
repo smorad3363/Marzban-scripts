@@ -21,6 +21,7 @@ import uuid
 ORIGINAL_MODULE_SHA256 = "12757c9b4f97095992f0b2dac5615e56317b047b382d34ef5a6e19484c22c83f"
 PATCHED_MODULE_SHA256 = "0656179bcb654f98ccd3b8d190f70d3bcb51a05d2dcc4979c8ac1e81e396ed37"
 MEMORY_BUDGET_PERCENT = 75
+SS2022_POLICY_CORE_VERSION = (26, 10, 31)
 
 RUNTIME_METHOD = '''    def _apply_runtime_limits(self):
         if os.getenv("XRAY_NODE_MEMORY_PROFILE", "") == "balanced":
@@ -157,9 +158,28 @@ def configured_image(compose, base, name):
     try:
         command(compose + ["-f", str(base), "-p", name, "run", "-d", "--rm", "--no-deps", "-T", "--name", probe,
                            "--entrypoint", "python", "marzban-node", "-c", "import time; time.sleep(60)"])
-        return inspect_container(probe)["Image"]
+        # Inspect the configured executable with its existing mounts. Updating
+        # the node image does not update a separately installed Xray binary.
+        result = command(["docker", "exec", probe, "python", "-c",
+                          "import os,subprocess,json; "
+                          "p=os.getenv('XRAY_EXECUTABLE_PATH','/usr/local/bin/xray'); "
+                          "r=subprocess.run([p,'version'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,universal_newlines=True,timeout=10); "
+                          "print(json.dumps({'version':r.stdout.splitlines()[0] if r.returncode==0 and r.stdout else '', 'executable':p}))"],
+                         timeout=15)
+        return {"image": inspect_container(probe)["Image"], "core": json.loads(result.stdout)}
     finally:
         command(["docker", "rm", "-f", probe], check=False, timeout=15)
+
+
+def report_core_compatibility(core, name):
+    version = core.get("version", "")
+    print("Runtime core: " + (version or "version unavailable") + " (existing executable preserved)", file=sys.stderr)
+    match = re.match(r"^Xray ([0-9]+)\.([0-9]+)\.([0-9]+)\b", version)
+    if not match or tuple(map(int, match.groups())) < SS2022_POLICY_CORE_VERSION:
+        print("Warning: this legacy or unrecognized core may ignore the SS2022 idle and buffer policy. "
+              "GOMEMLIMIT alone cannot prevent connection accumulation or GC CPU pressure. "
+              "Use '" + name + " core-update' to select a compatible core (tested: v26.10.31); "
+              "the installer does not silently replace your core.", file=sys.stderr)
 
 
 def image_module(image):
@@ -178,7 +198,9 @@ def prepare(base, overlay, data, name, compose_string):
         raise RuntimeError("The container name belongs to another service")
     previous = json.loads(overlay.read_text()) if overlay.exists() else {}
     budget = choose_budget(effective_memory())
-    image = configured_image(compose, base, name)
+    configured = configured_image(compose, base, name)
+    image = configured["image"]
+    report_core_compatibility(configured["core"], name)
     source = image_module(image)
     module = data / "node-runtime-patch" / "xray.py"
     updated = runtime_override(previous, image, module, budget)

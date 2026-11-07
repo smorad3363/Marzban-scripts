@@ -80,13 +80,24 @@ master core-update
 
 The memory profile uses `GOGC=50` and assigns 75% of the server's effective
 RAM to Go's soft memory budget. Installation and upgrades recalculate this budget,
-including instances previously installed with the 50% policy. Idle
-connections, handshakes and buffers receive the same limits validated on the test
-nodes; traffic counters and account settings are retained. This is a soft Go
+including instances previously installed with the 50% policy. The profile adds
+idle, handshake and buffer policies; their enforcement depends on the protocol
+and core implementation. Traffic counters and account settings are retained. This is a soft Go
 budget, not a hard RSS cap. Diagnostics stay opt-in to avoid port collisions
 between instances. The selected image is pinned locally in
 `/opt/<name>/docker-compose.runtime.json`; `update` still pulls the original image
 tag from the unchanged base Compose file before preparing its runtime.
+
+The installer reports the version of the **configured Xray executable**, including
+a core installed separately from the Docker image. It preserves that binary.
+Legacy SS2022 implementations, including v26.3.27, use a separate connection and
+buffer implementation that does not honor all of these policies. A soft Go budget
+cannot release buffers still held by accumulated connections; GC can then consume
+substantial CPU. The installer warns about this limitation instead of claiming
+that the memory profile fixes it. Use the existing `master core-update` menu to
+select a compatible version. Official v26.10.31 has been tested with v26.3.27
+SS2022 TCP/UDP and VMess clients; check your own routing and protocols before a
+fleet upgrade. It also changes the default handling of private destinations.
 
 The installer validates the runtime module and Compose configuration before
 recreating the node. Runtime backups are stored under
