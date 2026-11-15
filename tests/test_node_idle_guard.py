@@ -9,6 +9,14 @@ spec.loader.exec_module(guard)
 
 
 class IdleGuardTests(unittest.TestCase):
+    def test_ipv4_mapped_and_native_ipv6_filters_are_bracketed(self):
+        item = {"local": ("::ffff:192.0.2.1", 8086), "peer": ("::ffff:198.51.100.2", 50000)}
+        result = guard.socket_filter(item)
+        self.assertEqual(result[1], "[::ffff:192.0.2.1]")
+        self.assertEqual(result[6], "[::ffff:198.51.100.2]")
+        item["local"] = ("::1", 8086)
+        self.assertEqual(guard.socket_filter(item)[1], "[::1]")
+
     def sample(self, port=8086, inode=42, received=500, idle=610000, queue=0):
         return guard.parse_sockets(f"0 {queue} [::ffff:192.0.2.1]:{port} [::ffff:198.51.100.2]:54321 users:((\"xray\",pid=100,fd=10)) ino:{inode} bytes_sent:100 bytes_received:{received} lastsnd:{idle} lastrcv:{idle} lastack:5")
 

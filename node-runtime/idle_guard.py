@@ -46,6 +46,16 @@ def snapshot():
     return parse_sockets(command(["ss", "-HtniepO", "state", "established"]))
 
 
+def socket_filter(item):
+    host, port = item["local"]
+    peer, peer_port = item["peer"]
+    # iproute2 treats an unbracketed IPv6 suffix as a port, including
+    # IPv4-mapped addresses returned for dual-stack Xray listeners.
+    host = "[" + host + "]" if ":" in host else host
+    peer = "[" + peer + "]" if ":" in peer else peer
+    return ["src", host, "sport", "=", ":" + str(port), "dst", peer, "dport", "=", ":" + str(peer_port)]
+
+
 def owners(container):
     inspected = json.loads(command(["docker", "inspect", container]))[0]
     if inspected["Config"].get("Labels", {}).get("com.docker.compose.service") != "marzban-node":
@@ -118,9 +128,7 @@ def run(container, state_path, idle_seconds=300, apply=False, limit=100):
         fresh_owned, protected = owners(container)
         selected = eligible(fresh, selected, fresh_owned, protected, idle_seconds)
         for inode, item in list(selected.items())[:limit]:
-            host, port = item["local"]
-            peer, peer_port = item["peer"]
-            command(["ss", "-Knt", "src", host, "sport", "=", ":" + str(port), "dst", peer, "dport", "=", ":" + str(peer_port)])
+            command(["ss", "-Knt"] + socket_filter(item))
             attempted += 1
         remaining = snapshot()
         closed = sum(inode not in remaining for inode in list(selected)[:limit])

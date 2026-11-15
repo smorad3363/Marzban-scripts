@@ -87,6 +87,10 @@ budget, not a hard RSS cap. Diagnostics stay opt-in to avoid port collisions
 between instances. The selected image is pinned locally in
 `/opt/<name>/docker-compose.runtime.json`; `update` still pulls the original image
 tag from the unchanged base Compose file before preparing its runtime.
+If pulling the standard Docker Hub image fails or is rate limited, the official
+GHCR mirror is pulled and tagged locally. The base Compose file is retained and
+the same runtime source checks run before deployment. Custom images are never
+silently replaced with the standard mirror.
 
 Install/update/restart now select official **Xray v26.3.27** on amd64 and arm64.
 Both archive and executable SHA256 values are checked before deployment. The
