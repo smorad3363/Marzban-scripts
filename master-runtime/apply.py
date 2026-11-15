@@ -15,12 +15,24 @@ from patches import patch_control, patch_health, digest
 def compose_text(source, directory):
     lines = source.splitlines(True)
     matches = [i for i, line in enumerate(lines) if ":/code/app/xray/node.py" in line and line.lstrip().startswith("-")]
-    if len(matches) != 1 or ":/code/app/jobs/0_xray_core.py" in source:
+    if len(matches) > 1 or ":/code/app/jobs/0_xray_core.py" in source:
         raise ValueError("Unrecognized master mounts; existing configuration was not changed")
-    index = matches[0]
-    indent = lines[index][:len(lines[index]) - len(lines[index].lstrip())]
-    lines[index:index + 1] = [indent + "- " + str(directory / "node.py") + ":/code/app/xray/node.py:ro\n",
-                             indent + "- " + str(directory / "health.py") + ":/code/app/jobs/0_xray_core.py:ro\n"]
+    if matches:
+        index = matches[0]
+        indent = lines[index][:len(lines[index]) - len(lines[index].lstrip())]
+        remove = 1
+    else:
+        services = [i for i, line in enumerate(lines) if line.strip() == 'marzban:' and line.startswith('  ') and not line.startswith('   ')]
+        if len(services) != 1:
+            raise ValueError('Unrecognized master service')
+        begin = services[0] + 1
+        end = next((i for i in range(begin, len(lines)) if lines[i].strip() and not lines[i].lstrip().startswith('#') and len(lines[i]) - len(lines[i].lstrip()) <= 2), len(lines))
+        volumes = [i for i in range(begin, end) if lines[i].strip() == 'volumes:' and lines[i].startswith('    ') and not lines[i].startswith('     ')]
+        if len(volumes) != 1:
+            raise ValueError('Unrecognized master volumes')
+        index, indent, remove = volumes[0] + 1, '      ', 0
+    lines[index:index + remove] = [indent + "- " + str(directory / "node.py") + ":/code/app/xray/node.py:ro\n",
+                                  indent + "- " + str(directory / "health.py") + ":/code/app/jobs/0_xray_core.py:ro\n"]
     return "".join(lines)
 
 
@@ -45,7 +57,7 @@ def apply(root):
     root = Path(root)
     base = root / "docker-compose.yml"
     before = base.read_text()
-    node = (root / "node.py").read_text()
+    node = run(['docker', 'exec', 'marzban-marzban-1', 'cat', '/code/app/xray/node.py']).stdout
     health = run(["docker", "exec", "marzban-marzban-1", "cat", "/code/app/jobs/0_xray_core.py"]).stdout
     patched_node, patched_health = patch_control(node), patch_health(health)
     directory = root / "master-stability"

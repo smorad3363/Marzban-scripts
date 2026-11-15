@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('admission', ROOT / 'node-runtime/connection_guard.py')
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
+
+
+class AdmissionTests(unittest.TestCase):
+    def test_pressure_has_headroom_and_hysteresis(self):
+        settings = (65536, 75, 60)
+        self.assertEqual(guard.pressure(49151, 131072, settings), (False, 65536))
+        self.assertTrue(guard.pressure(49152, 131072, settings)[0])
+        self.assertTrue(guard.pressure(45000, 131072, settings, True)[0])
+        self.assertFalse(guard.pressure(39321, 131072, settings, True)[0])
+        self.assertEqual(guard.pressure(30000, 32768, settings), (True, 32768))
+
+    def test_ram_defaults_are_bounded(self):
+        for gib, expected in [(1,32768),(4,65536),(8,131072),(64,131072)]:
+            with mock.patch.object(Path, 'read_text', return_value='MemTotal: '+str(gib*1024**2)+' kB\n'):
+                self.assertEqual(guard.default_budget(), expected)
+
+    def test_policy_rejects_typos_invalid_limits_and_wrong_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'policy.json'
+            for value in [{'provider_limt': 10000}, {'tracked_budget': 0}, {'tracked_budget': True}, {'pause_percent': 99}, {'resume_percent': 80}, {'tracked_budget': '65536'}]:
+                path.write_text(json.dumps(value))
+                with self.assertRaises(ValueError): guard.policy(path)
+            path.write_text(json.dumps({'tracked_budget': 50000}))
+            self.assertEqual(guard.policy(path), (50000, 75, 60))
+
+    def test_only_owned_public_listeners_are_selected(self):
+        output='\n'.join([
+            'LISTEN 0 4096 0.0.0.0:8085 0.0.0.0:* users:(("xray",pid=55,fd=1))',
+            'LISTEN 0 4096 [::]:8443 [::]:* users:(("xray",pid=55,fd=2))',
+            'LISTEN 0 4096 127.0.0.1:25443 0.0.0.0:* users:(("xray",pid=55,fd=3))',
+            'LISTEN 0 4096 [::1]:25444 [::]:* users:(("xray",pid=55,fd=4))',
+            'LISTEN 0 4096 *:62051 *:* users:(("xray",pid=55,fd=5))',
+            'LISTEN 0 4096 *:22 *:* users:(("sshd",pid=1,fd=6))'])
+        self.assertEqual(guard.listener_ports(output, {55}, {22,62051}), {8085,8443})
+
+    def test_gate_preserves_established_udp_loopback_and_ssh(self):
+        text=guard.rules({22,6111,8085,8443}, True)
+        self.assertIn('--syn -m conntrack --ctstate NEW', text)
+        self.assertIn('! -i lo', text)
+        self.assertIn('--dports 8085,8443', text)
+        self.assertNotIn('-p udp', text)
+        self.assertNotIn('ESTABLISHED', text)
+        self.assertIn('--reject-with tcp-reset', text)
+        self.assertNotIn('-j REJECT', guard.rules({8085}, False))
+
+    def test_many_ports_respect_multiport_kernel_limit(self):
+        text=guard.rules(set(range(10000,10040)), True)
+        entries=[x for x in text.splitlines() if '--dports' in x]
+        self.assertEqual(len(entries), 3)
+        for line in entries:self.assertLessEqual(len(line.split('--dports ')[1].split()[0].split(',')),15)
+
+    def test_foreign_chain_is_never_replaced_or_removed(self):
+        with mock.patch.object(guard, 'run', return_value=subprocess.CompletedProcess([],0,'-N MZN_ADMIT\n','')) as run, mock.patch.object(guard.shutil,'which',return_value='/sbin/fixture'):
+            with self.assertRaisesRegex(RuntimeError, 'unowned'):guard.Firewall(['iptables']).apply({8085},True)
+        self.assertEqual(run.call_count,1)
+
+    def test_restore_is_scoped_and_never_flushes_all_rules(self):
+        def command(args, **kwargs):
+            return subprocess.CompletedProcess(args,1 if '-S' in args or '-C' in args else 0,'','')
+        with mock.patch.object(guard, 'run', side_effect=command) as run, mock.patch.object(guard.shutil,'which',return_value='/sbin/fixture'):
+            guard.Firewall(['iptables']).apply({8085},True)
+        restores=[x for x in run.call_args_list if 'iptables-restore' in x.args[0]]
+        self.assertEqual(len(restores),1)
+        self.assertIn('--noflush',restores[0].args[0])
+        self.assertIn('-F MZN_ADMIT', restores[0].kwargs['input'])
+        self.assertFalse(any(x.args[0][-1:] == ['-F'] for x in run.call_args_list))
+
+
+if __name__ == '__main__':unittest.main(verbosity=2)

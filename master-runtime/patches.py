@@ -6,6 +6,7 @@ import ast
 import hashlib
 
 NODE_SOURCE_SHA256 = "3450283fd75d2222d5b22c26bfbe696283608a37b59e6f21cd02a1072949ed01"
+LEGACY_NODE_SOURCE_SHA256 = 'c65ff71f8208a841e011fa29b678ad02ccc31c7ad3dec5dd83a139f485d1b374'
 HEALTH_SOURCE_SHA256 = "48ca5cece9061c7c37c44c59080b2d591b1fdb9e74afcdfe7deff2750783db64"
 
 SERIALIZER = '''
@@ -93,7 +94,7 @@ def digest(source):
 def patch_control(source):
     if "def _serialized_node_control(" in source:
         raise ValueError("Master control is already patched; retain its reviewed files")
-    if digest(source) != NODE_SOURCE_SHA256:
+    if digest(source) not in {NODE_SOURCE_SHA256, LEGACY_NODE_SOURCE_SHA256}:
         raise ValueError("Unsupported master control source; no live service was changed")
     tree = ast.parse(source)
     node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ReSTXRayNode")

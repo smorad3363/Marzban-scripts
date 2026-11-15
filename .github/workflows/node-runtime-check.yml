@@ -10,6 +10,7 @@ on:
       - tools/embed-node-runtime.py
       - tests/test_node_runtime*.py
       - tests/test_node_idle_guard.py
+      - tests/test_node_connection_guard*.py
       - tests/fixtures/node-*
       - tests/fixtures/master-*
       - .github/workflows/node-runtime-check.yml
@@ -22,6 +23,7 @@ on:
       - tools/embed-node-runtime.py
       - tests/test_node_runtime*.py
       - tests/test_node_idle_guard.py
+      - tests/test_node_connection_guard*.py
       - tests/fixtures/node-*
       - tests/fixtures/master-*
       - .github/workflows/node-runtime-check.yml
@@ -43,7 +45,10 @@ jobs:
         run: |
           python3 tests/test_node_runtime.py
           python3 tests/test_node_idle_guard.py
+          python3 tests/test_node_connection_guard.py
           python3 tests/test_master_runtime.py
+      - name: Verify real admission rules in isolated network namespaces
+        run: sudo --preserve-env=GITHUB_ACTIONS "$(command -v python3)" tests/test_node_connection_guard_kernel.py
       - name: Install integration client dependencies
         run: python3 -m pip install requests rpyc
       - name: Test real fresh install, legacy REST and RPyC upgrades, and recovery
