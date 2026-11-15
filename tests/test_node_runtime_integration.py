@@ -175,6 +175,44 @@ def check_idle_socket(socks_port):
         state.unlink(missing_ok=True)
 
 
+def check_half_closed_socket():
+    """A disposable process in the fixture container owns a real CLOSE-WAIT."""
+    spec = importlib.util.spec_from_file_location("guard_half", ROOT / "node-runtime/idle_guard.py")
+    guard = importlib.util.module_from_spec(spec); spec.loader.exec_module(guard)
+    code = """import socket,ctypes,json,sys,os
+ctypes.CDLL(None).prctl(15,b'xray',0,0,0)
+s=socket.socket();s.bind(('127.0.0.1',0));s.listen()
+print(json.dumps({'port':s.getsockname()[1]}),flush=True)
+c,_=s.accept()
+while c.recv(1024): pass
+print('half-close-ready',flush=True)
+sys.stdin.readline()
+c.close();s.close()
+"""
+    process = subprocess.Popen([REAL_DOCKER, "exec", "-i", "master", "python", "-u", "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stream = None
+    state = DATA / "fixture-half-close-state.json"
+    try:
+        port = json.loads(process.stdout.readline())["port"]
+        stream = socket.create_connection(("127.0.0.1", port), timeout=5)
+        stream.sendall(b"half-close-fixture")
+        stream.shutdown(socket.SHUT_WR)
+        assert process.stdout.readline().strip() == "half-close-ready"
+        time.sleep(1.2)
+        guard.run("master", state, idle_seconds=1)
+        old = json.loads(state.read_text())
+        assert any(v.get("state") == "close-wait" and v["local"][1] == port for v in old["sockets"].values()), "CLOSE-WAIT fixture missing"
+        old["time"] -= 31; state.write_text(json.dumps(old))
+        result = guard.run("master", state, idle_seconds=1, apply=True)
+        assert result["closed"] >= 1, result
+        print("PASS: real application-owned CLOSE-WAIT was reaped", flush=True)
+    finally:
+        if stream: stream.close()
+        process.stdin.close()
+        process.wait(timeout=10)
+        state.unlink(missing_ok=True)
+
+
 def command_env(bin_dir, marker=None, cli_failure=False):
     result = dict(os.environ, PATH=str(bin_dir) + ":" + os.environ["PATH"], TERM="xterm", NODE_TEST_SCRIPT=str(SCRIPT), NODE_TEST_REAL_DOCKER=REAL_DOCKER, NODE_TEST_REAL_CURL=REAL_CURL, NODE_TEST_REAL_INSTALL=REAL_INSTALL)
     result["NODE_TEST_FAIL_CLI_COPY"] = "1" if cli_failure else "0"
@@ -262,6 +300,7 @@ os.execv(os.environ['NODE_TEST_REAL_INSTALL'],[os.environ['NODE_TEST_REAL_INSTAL
                     raise RuntimeError(log.read()[-6000:])
             assert (APP / "docker-compose.runtime.json").is_file()
             check_runtime_and_data(cert, key, origin)
+            check_half_closed_socket()
 
             print("Testing an already-profiled node moving from 50% to 75%", flush=True)
             overlay_path = APP / "docker-compose.runtime.json"

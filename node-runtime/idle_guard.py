@@ -43,7 +43,15 @@ def parse_sockets(output):
 
 
 def snapshot():
-    return parse_sockets(command(["ss", "-HtniepO", "state", "established"]))
+    result = {}
+    # An application-owned half-close is not covered by the kernel's orphaned
+    # FIN-WAIT timeout. Reap confirmed idle half-closes before open sessions.
+    for state in ("fin-wait-2", "close-wait", "established"):
+        sockets = parse_sockets(command(["ss", "-HtniepO", "state", state]))
+        for item in sockets.values():
+            item["state"] = state
+        result.update(sockets)
+    return result
 
 
 def socket_filter(item):
@@ -94,7 +102,10 @@ def eligible(current, previous, owned, protected, idle_seconds):
     selected = {}
     for inode, item in current.items():
         before = previous.get(inode)
-        if inode not in owned or before is None or any(item["queues"]):
+        receive, send = item["queues"]
+        # CLOSE-WAIT's final FIN can occupy one sequence byte without payload.
+        empty = send == 0 and (receive == 0 or item.get("state") == "close-wait" and receive == 1)
+        if inode not in owned or before is None or not empty:
             continue
         if item["local"][1] in protected or item["peer"][1] in protected:
             continue
@@ -138,17 +149,20 @@ def run(container, state_path, idle_seconds=300, apply=False, limit=2000):
         selected = eligible(fresh, selected, fresh_owned, protected, idle_seconds)
         targets = list(selected.items())[:limit]
         for offset in range(0, len(targets), 64):
-            batch = dict(targets[offset:offset + 64])
-            filters = batch_filter(batch.values())
-            # Fail closed if the installed iproute2 interprets a filter more
-            # broadly than the exact, already-owned socket inode set.
-            matches = parse_sockets(command(["ss", "-HtniepO", "state", "established"] + filters))
-            if set(matches) - set(batch):
-                raise RuntimeError("Socket batch filter matched an unexpected inode")
-            confirmed = eligible(matches, batch, fresh_owned, protected, idle_seconds)
-            if confirmed:
-                command(["ss", "-Knt", "state", "established"] + batch_filter(confirmed.values()))
-                attempted += len(confirmed)
+            for state in ("fin-wait-2", "close-wait", "established"):
+                batch = {k: v for k, v in targets[offset:offset + 64] if v.get("state", "established") == state}
+                if not batch:
+                    continue
+                filters = batch_filter(batch.values())
+                # Fail closed if iproute2 matches an unexpected socket inode.
+                matches = parse_sockets(command(["ss", "-HtniepO", "state", state] + filters))
+                for item in matches.values(): item["state"] = state
+                if set(matches) - set(batch):
+                    raise RuntimeError("Socket batch filter matched an unexpected inode")
+                confirmed = eligible(matches, batch, fresh_owned, protected, idle_seconds)
+                if confirmed:
+                    command(["ss", "-Knt", "state", state] + batch_filter(confirmed.values()))
+                    attempted += len(confirmed)
         remaining = snapshot()
         closed = sum(inode not in remaining for inode in list(selected)[:limit])
         current = remaining
