@@ -334,7 +334,9 @@ def configured_image(compose, base, name):
                           "r=subprocess.run([p,'version'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,universal_newlines=True,timeout=10); "
                           "print(json.dumps({'version':r.stdout.splitlines()[0] if r.returncode==0 and r.stdout else '', 'executable':p}))"],
                          timeout=15)
-        return {"image": inspect_container(probe)["Image"], "core": json.loads(result.stdout)}
+        inspected = inspect_container(probe)
+        return {"image": inspected["Image"], "core": json.loads(result.stdout),
+                "memory_limit": max(0, int(inspected.get("HostConfig", {}).get("Memory", 0)))}
     finally:
         command(["docker", "rm", "-f", probe], check=False, timeout=15)
 
@@ -411,8 +413,11 @@ def prepare(base, overlay, data, name, compose_string):
     if old_container and old_container["Config"].get("Labels", {}).get("com.docker.compose.service") != "marzban-node":
         raise RuntimeError("The container name belongs to another service")
     previous = json.loads(overlay.read_text()) if overlay.exists() else {}
-    budget = choose_budget(effective_memory())
     configured = configured_image(compose, base, name)
+    memory = effective_memory()
+    if configured.get("memory_limit", 0) > 0:
+        memory = min(memory, configured["memory_limit"])
+    budget = choose_budget(memory)
     image = configured["image"]
     report_core_compatibility(configured["core"], name)
     source = image_module(image)
@@ -433,7 +438,7 @@ def prepare(base, overlay, data, name, compose_string):
              "old_id": old_container["Id"] if old_container else None,
              "old_restart_count": old_container["RestartCount"] if old_container else 0,
              "was_running": bool(old_container and old_container["State"]["Running"]),
-             "budget": budget, "image": image, "backup": str(backup)}
+             "budget": budget, "image": image, "backup": str(backup), "memory_limit": configured.get("memory_limit", 0)}
     paths = dict(guard_paths(data, name), rest_module=rest_module, network_profile=Path("/etc/sysctl.d/93-marzban-node-network.conf"))
     state.update({key: str(value) for key, value in paths.items()})
     state["network_old"], state["network_new"] = network_plan()
@@ -512,6 +517,8 @@ def verify(statefile):
             raise RuntimeError("Node container did not remain running")
         if container["Image"] != state["image"]:
             raise RuntimeError("Running node image differs from the prepared runtime")
+        if container.get("HostConfig", {}).get("Memory", 0) != state["memory_limit"]:
+            raise RuntimeError("Running node memory limit differs from the prepared runtime")
         env = environment(container["Config"].get("Env"))
         if any(env.get(key) != value for key, value in {"GOGC": "50", "GOMEMLIMIT": state["budget"], "XRAY_NODE_MEMORY_PROFILE": "balanced"}.items()):
             raise RuntimeError("Node runtime environment was not applied")

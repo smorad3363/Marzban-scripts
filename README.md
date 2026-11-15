@@ -118,6 +118,10 @@ It does not change interface MTU, routes, DNS, congestion control or firewall
 policy. Multiple node instances are serialized with one host-wide installer lock.
 The 75% Go budget is per instance and is not a reservation; several busy instances
 can exceed host RAM together and need a shared capacity plan.
+An explicit Compose memory limit is included in the effective-memory calculation:
+the Go budget is 75% of the smaller host or target-container limit. Setting a
+container limit can therefore reserve host capacity for kernel buffers and other
+services without changing the default 75% policy.
 
 The installer validates the runtime module and Compose configuration before
 recreating the node. Runtime backups are stored under
