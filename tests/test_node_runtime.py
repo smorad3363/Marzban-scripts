@@ -206,6 +206,21 @@ class MigrationTests(unittest.TestCase):
 
 
 class ContractTests(unittest.TestCase):
+    def test_version_display_prefers_the_active_pinned_core_to_a_legacy_binary(self):
+        script = (ROOT / "marzban-node.sh").read_text()
+        function = re.search(r"^get_current_xray_core_version\(\) \{\n.*?^\}\n", script, re.M | re.S)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "xray-core").mkdir()
+            old = root / "xray-core/xray"
+            old.write_text("#!/bin/sh\necho 'Xray 25.3.6 legacy'\n")
+            old.chmod(0o700)
+            (root / "overlay.json").write_text("{}")
+            shell = function + '\ndocker() { echo "Xray 26.3.27 active"; }\nget_current_xray_core_version\n'
+            env = dict(os.environ, DATA_MAIN_DIR=str(root), RUNTIME_COMPOSE_FILE=str(root / "overlay.json"), APP_NAME="master")
+            result = subprocess.run(["bash", "-c", shell], env=env, capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout.strip(), "26.3.27 (in container)")
+
     def test_docker_hub_failure_uses_official_mirror_without_rewriting_compose(self):
         calls = []
         def run(args, **kwargs):
