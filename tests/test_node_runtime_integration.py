@@ -80,9 +80,11 @@ def check_runtime_and_data(cert, key, origin, protocol="rest", service_port=6205
         response = session.post("https://127.0.0.1:" + str(service_port) + "/connect", timeout=10)
         response.raise_for_status()
         token = response.json()["session_id"]
+        started_at = time.monotonic()
         response = session.post("https://127.0.0.1:" + str(service_port) + "/start", json={"session_id": token, "config": json.dumps(configuration)}, timeout=12)
         response.raise_for_status()
         assert response.json()["started"]
+        assert time.monotonic() - started_at < 2.5, "REST waited past the core-ready log message"
     else:
         # Build the context explicitly: RPyC's convenience wrapper cannot disable
         # hostname checking before CERT_NONE on recent Python versions.
@@ -102,10 +104,60 @@ def check_runtime_and_data(cert, key, origin, protocol="rest", service_port=6205
         assert "GOMEMLIMIT=" + expected_budget in child_env, child_env
         body = run([REAL_CURL, "-fsS", "--noproxy", "", "--proxy", "socks5h://127.0.0.1:" + str(socks_port), "--max-time", "10", origin])
         assert hashlib.sha256(body).digest() == hashlib.sha256(PAYLOAD).digest()
+        if protocol == "rest":
+            check_idle_socket(socks_port)
+            response = session.post("https://127.0.0.1:" + str(service_port) + "/ping", json={"session_id": token}, timeout=5)
+            response.raise_for_status()
     finally:
         if peer:
             peer.close()
     print("PASS: real " + protocol.upper() + " control, child Go environment and verified proxy payload", flush=True)
+
+
+def check_idle_socket(socks_port):
+    spec = importlib.util.spec_from_file_location("guard", ROOT / "node-runtime/idle_guard.py")
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    def echo():
+        stream, _ = listener.accept()
+        with stream:
+            while True:
+                data = stream.recv(1024)
+                if not data:
+                    return
+                stream.sendall(data)
+    thread = threading.Thread(target=echo, daemon=True)
+    thread.start()
+    stream = socket.create_connection(("127.0.0.1", socks_port), timeout=5)
+    state = DATA / "fixture-idle-state.json"
+    try:
+        stream.sendall(b"\x05\x01\x00")
+        assert stream.recv(2) == b"\x05\x00"
+        stream.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") + listener.getsockname()[1].to_bytes(2, "big"))
+        assert stream.recv(10)[1] == 0
+        stream.sendall(b"idle-guard-fixture")
+        assert stream.recv(100) == b"idle-guard-fixture"
+        time.sleep(1.2)
+        # The short threshold is restricted to this isolated root-owned fixture;
+        # the production CLI refuses values below 300 seconds.
+        guard.run("master", state, idle_seconds=1)
+        previous = json.loads(state.read_text())
+        previous["time"] -= 31
+        state.write_text(json.dumps(previous))
+        result = guard.run("master", state, idle_seconds=1, apply=True)
+        assert result["closed"] >= 1, result
+        try:
+            assert stream.recv(1) == b"", "idle socket survived"
+        except ConnectionResetError:
+            pass
+        print("PASS: kernel socket destruction reaped only fixture idle data sockets", flush=True)
+    finally:
+        stream.close()
+        listener.close()
+        state.unlink(missing_ok=True)
 
 
 def command_env(bin_dir, marker=None, cli_failure=False):

@@ -64,7 +64,7 @@ sudo bash -c "$(curl -sL https://github.com/smorad3363/Marzban-scripts/raw/maste
 ```
 
 Use this same command on an existing `master` node to upgrade it in place. It
-preserves the certificate, ports, protocol, existing core binary, data and original
+preserves the certificate, ports, protocol, previous core binary, data and original
 `docker-compose.yml`; it does not ask for the certificate again. Keep the original
 instance name when upgrading another instance.
 
@@ -88,16 +88,32 @@ between instances. The selected image is pinned locally in
 `/opt/<name>/docker-compose.runtime.json`; `update` still pulls the original image
 tag from the unchanged base Compose file before preparing its runtime.
 
-The installer reports the version of the **configured Xray executable**, including
-a core installed separately from the Docker image. It preserves that binary.
-Legacy SS2022 implementations, including v26.3.27, use a separate connection and
-buffer implementation that does not honor all of these policies. A soft Go budget
-cannot release buffers still held by accumulated connections; GC can then consume
-substantial CPU. The installer warns about this limitation instead of claiming
-that the memory profile fixes it. Use the existing `master core-update` menu to
-select a compatible version. Official v26.10.31 has been tested with v26.3.27
-SS2022 TCP/UDP and VMess clients; check your own routing and protocols before a
-fleet upgrade. It also changes the default handling of private destinations.
+Install/update/restart now select official **Xray v26.3.27** on amd64 and arm64.
+Both archive and executable SHA256 values are checked before deployment. The
+previous executable and assets remain available for rollback. The version pin is
+in the runtime overlay, so `core-update` does not override it on the next install,
+update or restart.
+
+The runtime reaps terminated children, serializes core changes, and drains stderr
+with stdout. REST start/restart returns when the core-ready message arrives,
+instead of always waiting the complete three-second timeout.
+
+Some v26.3.27 transports, including legacy SS2022, do not fully enforce `connIdle`.
+A per-instance systemd timer therefore checks only that container's Xray TCP
+sockets. It closes at most 100 sockets per minute after five minutes without data,
+requiring unchanged byte counters in two observations, empty queues, matching
+socket ownership and a final rescan. SSH and node control ports are excluded.
+This also closes deliberately idle live client sessions after five minutes;
+clients reconnect normally. It does not kill processes or flush conntrack. UDP
+is retained because its use must be established separately for each service.
+
+The host profile enables TCP MTU probing, keeps stricter existing keepalive
+settings, limits the default established conntrack timeout to two hours, disables
+router redirects and increases undersized conntrack tables according to RAM.
+It does not change interface MTU, routes, DNS, congestion control or firewall
+policy. Multiple node instances are serialized with one host-wide installer lock.
+The 75% Go budget is per instance and is not a reservation; several busy instances
+can exceed host RAM together and need a shared capacity plan.
 
 The installer validates the runtime module and Compose configuration before
 recreating the node. Runtime backups are stored under
