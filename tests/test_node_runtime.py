@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -74,6 +75,32 @@ class ModuleTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"XRAY_NODE_METRICS_LISTEN": "127.0.0.1:25443"}, clear=True):
             self.assertEqual(module.XRayConfig("{}", "192.0.2.1")["metrics"]["listen"], "127.0.0.1:25443")
 
+    def test_restart_reaps_previous_child_and_drains_stderr(self):
+        module = self.load_runtime()
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "fixture-xray"
+            marker = Path(directory) / "ready"
+            executable.write_text("#!" + sys.executable + "\nimport sys,time,pathlib\nif 'version' in sys.argv:\n print('Xray 26.3.27 fixture'); sys.exit()\nsys.stdin.read()\nsys.stderr.write('fixture warning\\n' * 12000); sys.stderr.flush()\npathlib.Path(" + repr(str(marker)) + ").write_text('ready')\nwhile True: time.sleep(.05)\n")
+            executable.chmod(0o700)
+            core = module.XRayCore(str(executable))
+            config = module.XRayConfig("{}", "127.0.0.1")
+            try:
+                core.start(config)
+                previous = core.process
+                deadline = time.monotonic() + 5
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(marker.exists(), "stderr pipe blocked the core")
+                core.restart(config)
+                self.assertIsNotNone(previous.returncode, "previous core was not reaped")
+                self.assertNotEqual(core.process.pid, previous.pid)
+                current = core.process
+                core.stop()
+                self.assertIsNotNone(current.returncode)
+                self.assertIsNone(core.process)
+            finally:
+                core.stop()
+
 
 class MigrationTests(unittest.TestCase):
     def setUp(self):
@@ -101,6 +128,10 @@ class MigrationTests(unittest.TestCase):
                       mock.patch.object(manager, "inspect_container", return_value=copy.deepcopy(self.old)),
                       mock.patch.object(manager, "configured_image", return_value={"image": "sha256:new-image", "core": {"version": "Xray 26.3.27", "executable": "/var/lib/marzban-node/xray-core/xray"}}),
                       mock.patch.object(manager, "image_module", return_value=manager.patch_module(SOURCE)),
+                      mock.patch.object(manager, "image_rest_module", return_value=manager.patch_rest_module((ROOT / "tests/fixtures/node-rest.original.py").read_text())),
+                      mock.patch.object(manager, "stage_pinned_core", return_value=self.data / "pinned/xray"),
+                      mock.patch.object(manager, "guard_paths", return_value={"guard": self.data / "idle_guard.py", "guard_service": self.root / "idle.service", "guard_timer": self.root / "idle.timer"}),
+                      mock.patch.object(manager, "network_plan", return_value=({}, {})),
                       mock.patch.object(manager, "effective_memory", return_value=8 * 1024**3)]:
             patch.start()
             self.addCleanup(patch.stop)
@@ -175,6 +206,26 @@ class MigrationTests(unittest.TestCase):
 
 
 class ContractTests(unittest.TestCase):
+    def test_pin_rejects_download_tampering_before_creating_an_executable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = b"unverified archive"
+            with mock.patch.object(manager.platform, "machine", return_value="x86_64"), mock.patch.object(manager.urllib.request, "urlopen", return_value=response):
+                with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                    manager.stage_pinned_core(directory)
+            self.assertFalse((Path(directory) / "node-runtime-core").exists())
+
+    def test_network_profile_keeps_stricter_timeouts_and_larger_tables(self):
+        current = {"net.ipv4.tcp_keepalive_time": "60", "net.ipv4.tcp_keepalive_intvl": "10", "net.ipv4.tcp_keepalive_probes": "3",
+                   "net.netfilter.nf_conntrack_tcp_timeout_established": "600", "net.netfilter.nf_conntrack_max": "524288", "net.ipv4.tcp_mtu_probing": "2"}
+        def probe(args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, current.get(args[-1], "1") + "\n", "")
+        with mock.patch.object(manager, "command", side_effect=probe), mock.patch.object(manager, "effective_memory", return_value=2 * 1024**3):
+            old, new = manager.network_plan()
+        for key, value in current.items():
+            self.assertEqual(new[key], value)
+        self.assertEqual(new["net.ipv4.conf.all.send_redirects"], "0")
+
     def test_legacy_core_warning_does_not_claim_soft_memory_budget_fixes_ss2022(self):
         for version in ("Xray 26.3.27 (Xray)", "Xray 26.9.9", "Xray 1.8.24", "custom core", ""):
             output = io.StringIO()
@@ -182,7 +233,7 @@ class ContractTests(unittest.TestCase):
                 manager.report_core_compatibility({"version": version}, "node2")
             self.assertIn("Warning:", output.getvalue())
             self.assertIn("node2 core-update", output.getvalue())
-            self.assertIn("existing executable preserved", output.getvalue())
+            self.assertIn("previous executable preserved for rollback", output.getvalue())
         for version in ("Xray 26.10.31 (Xray)", "Xray 26.11.1", "Xray 27.1.1"):
             output = io.StringIO()
             with contextlib.redirect_stderr(output):
