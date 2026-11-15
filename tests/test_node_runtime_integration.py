@@ -133,13 +133,27 @@ def check_idle_socket(socks_port):
     thread.start()
     stream = socket.create_connection(("127.0.0.1", socks_port), timeout=5)
     state = DATA / "fixture-idle-state.json"
+    def receive(count):
+        data = b""
+        while len(data) < count:
+            part = stream.recv(count - len(data))
+            if not part:
+                raise RuntimeError("SOCKS fixture closed before the complete reply")
+            data += part
+        return data
     try:
         stream.sendall(b"\x05\x01\x00")
-        assert stream.recv(2) == b"\x05\x00"
+        assert receive(2) == b"\x05\x00"
         stream.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") + listener.getsockname()[1].to_bytes(2, "big"))
-        assert stream.recv(10)[1] == 0
+        reply = receive(4)
+        assert reply[1] == 0
+        address_bytes = {1: 4, 4: 16}.get(reply[3])
+        if reply[3] == 3:
+            address_bytes = receive(1)[0]
+        assert address_bytes is not None, reply
+        receive(address_bytes + 2)
         stream.sendall(b"idle-guard-fixture")
-        assert stream.recv(100) == b"idle-guard-fixture"
+        assert receive(len(b"idle-guard-fixture")) == b"idle-guard-fixture"
         time.sleep(1.2)
         # The short threshold is restricted to this isolated root-owned fixture;
         # the production CLI refuses values below 300 seconds.
