@@ -70,7 +70,7 @@ def wait_port(port, timeout=60):
 def check_runtime_and_data(cert, key, origin, protocol="rest", service_port=62050, expected_percent=75):
     wait_port(service_port)
     socks_port = free_port()
-    configuration = {"log": {"loglevel": "warning"}, "inbounds": [{"tag": "integration-users", "listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"auth": "noauth"}}], "outbounds": [{"protocol": "freedom"}], "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}}}}
+    configuration = {"log": {"loglevel": "warning"}, "inbounds": [{"tag": "integration-users", "listen": "::", "port": socks_port, "protocol": "socks", "settings": {"auth": "noauth"}}], "outbounds": [{"protocol": "freedom"}], "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}}}}
     peer = None
     if protocol == "rest":
         session = requests.Session()
@@ -145,6 +145,7 @@ def check_idle_socket(socks_port):
         # the production CLI refuses values below 300 seconds.
         guard.run("master", state, idle_seconds=1)
         previous = json.loads(state.read_text())
+        assert any("::ffff:" in value["local"][0] for value in previous["sockets"].values()), "dual-stack socket fixture was not exercised"
         previous["time"] -= 31
         state.write_text(json.dumps(previous))
         result = guard.run("master", state, idle_seconds=1, apply=True)
