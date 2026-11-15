@@ -5,19 +5,25 @@ on:
     paths:
       - marzban-node.sh
       - node-runtime/**
+      - master-runtime/**
+      - tests/test_master_runtime.py
       - tools/embed-node-runtime.py
       - tests/test_node_runtime*.py
       - tests/test_node_idle_guard.py
       - tests/fixtures/node-*
+      - tests/fixtures/master-*
       - .github/workflows/node-runtime-check.yml
   pull_request:
     paths:
       - marzban-node.sh
       - node-runtime/**
+      - master-runtime/**
+      - tests/test_master_runtime.py
       - tools/embed-node-runtime.py
       - tests/test_node_runtime*.py
       - tests/test_node_idle_guard.py
       - tests/fixtures/node-*
+      - tests/fixtures/master-*
       - .github/workflows/node-runtime-check.yml
   workflow_dispatch:
 
@@ -37,6 +43,7 @@ jobs:
         run: |
           python3 tests/test_node_runtime.py
           python3 tests/test_node_idle_guard.py
+          python3 tests/test_master_runtime.py
       - name: Install integration client dependencies
         run: python3 -m pip install requests rpyc
       - name: Test real fresh install, legacy REST and RPyC upgrades, and recovery

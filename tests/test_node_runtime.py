@@ -172,6 +172,13 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(env["CUSTOM"], "keep")
         self.assertEqual(self.base.read_bytes(), self.original_base)
 
+    def test_target_container_memory_limit_bounds_the_go_budget(self):
+        with mock.patch.object(manager, "configured_image", return_value={"image": "sha256:new-image", "core": {"version": "Xray 26.3.27"}, "memory_limit": 4 * 1024**3}):
+            self.prepare()
+        env = json.loads(self.overlay.read_text())["services"]["marzban-node"]["environment"]
+        self.assertEqual(env["GOMEMLIMIT"], "3072MiB")
+        self.assertEqual(self.base.read_bytes(), self.original_base)
+
     def test_failure_restores_old_overlay_module_and_pins_the_previous_image(self):
         self.overlay.write_text('{"services":{}}\n')
         module = self.data / "node-runtime-patch/xray.py"

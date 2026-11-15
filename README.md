@@ -104,7 +104,7 @@ instead of always waiting the complete three-second timeout.
 
 Some v26.3.27 transports, including legacy SS2022, do not fully enforce `connIdle`.
 A per-instance systemd timer therefore checks only that container's Xray TCP
-sockets. It closes at most 100 sockets per minute after five minutes without data,
+sockets. It closes at most 2000 sockets per minute in verified batches after five minutes without data,
 requiring unchanged byte counters in two observations, empty queues, matching
 socket ownership and a final rescan. SSH and node control ports are excluded.
 This also closes deliberately idle live client sessions after five minutes;
@@ -118,6 +118,10 @@ It does not change interface MTU, routes, DNS, congestion control or firewall
 policy. Multiple node instances are serialized with one host-wide installer lock.
 The 75% Go budget is per instance and is not a reservation; several busy instances
 can exceed host RAM together and need a shared capacity plan.
+An explicit Compose memory limit is included in the effective-memory calculation:
+the Go budget is 75% of the smaller host or target-container limit. Setting a
+container limit can therefore reserve host capacity for kernel buffers and other
+services without changing the default 75% policy.
 
 The installer validates the runtime module and Compose configuration before
 recreating the node. Runtime backups are stored under
@@ -125,6 +129,28 @@ recreating the node. Runtime backups are stored under
 runtime and image. Unsupported future module versions are rejected before the
 running node is stopped. The master-side fixes tested separately are not applied
 to a different master by this node installer.
+
+### Legacy master connection stability
+
+`master-runtime/patches.py` contains separately reviewed, checksum-gated fixes for
+the deployed legacy master's control client and health job. The REST client
+serializes session changes and status requests, bounds TLS certificate retrieval
+to ten seconds, and uses a monotonic cache clock. The health job requires repeated
+failures and a fresh check before recovery, renews a stale REST gRPC channel first,
+and applies a two-minute recovery cooldown. An explicitly stopped core gets a
+shorter confirmation period. One slow two-second statistics probe no longer
+immediately restarts a data core.
+
+For the exact supported legacy source, run as root from this checkout:
+
+```bash
+python3 master-runtime/apply.py /opt/marzban
+```
+
+The helper refuses unknown source or mount layouts, backs up existing files,
+adds only the two code mounts, and recreates only the panel service. It does not
+modify accounts, accounting rules or database configuration. The node installer
+does not apply this master patch automatically to unrelated panel versions.
 
 ### Optional multi-instance wrapper
 
