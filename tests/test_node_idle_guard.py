@@ -9,6 +9,14 @@ spec.loader.exec_module(guard)
 
 
 class IdleGuardTests(unittest.TestCase):
+    def test_close_wait_fin_marker_is_not_treated_as_queued_payload(self):
+        current = self.sample()
+        current['42']['state'] = 'close-wait'
+        current['42']['queues'] = [1, 0]
+        self.assertTrue(guard.eligible(current, current, {'42'}, set(), 300))
+        current['42']['queues'] = [2, 0]
+        self.assertFalse(guard.eligible(current, current, {'42'}, set(), 300))
+
     def test_batch_keeps_complete_tuple_predicates_separated(self):
         item = {"local": ("192.0.2.1", 8086), "peer": ("198.51.100.1", 50000)}
         filters = guard.batch_filter([item, item])

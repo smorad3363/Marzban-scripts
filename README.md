@@ -110,6 +110,9 @@ socket ownership and a final rescan. SSH and node control ports are excluded.
 This also closes deliberately idle live client sessions after five minutes;
 clients reconnect normally. It does not kill processes or flush conntrack. UDP
 is retained because its use must be established separately for each service.
+Application-owned idle `FIN-WAIT-2` and `CLOSE-WAIT` sockets are included; the
+kernel's orphaned FIN timeout does not reliably release those application-owned
+descriptors. Half-closed sockets with queued payload are retained.
 
 The host profile enables TCP MTU probing, keeps stricter existing keepalive
 settings, limits the default established conntrack timeout to two hours, disables
