@@ -206,6 +206,22 @@ class MigrationTests(unittest.TestCase):
 
 
 class ContractTests(unittest.TestCase):
+    def test_docker_hub_failure_uses_official_mirror_without_rewriting_compose(self):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 1 if "pull" in args and args[0] == "docker" and args[1] == "compose" else 0, "", "rate limited")
+        with mock.patch.object(manager, "command", side_effect=run), mock.patch.object(manager, "configured_node_image", return_value="gozargah/marzban-node:latest"):
+            manager.pull_node_image("/opt/master/docker-compose.yml", "master", "docker compose")
+        self.assertIn(["docker", "pull", "ghcr.io/gozargah/marzban-node:latest"], calls)
+        self.assertIn(["docker", "tag", "ghcr.io/gozargah/marzban-node:latest", "gozargah/marzban-node:latest"], calls)
+
+    def test_custom_registry_failure_is_not_replaced_with_a_different_image(self):
+        with mock.patch.object(manager, "command", return_value=subprocess.CompletedProcess([], 1, "", "denied")) as run, mock.patch.object(manager, "configured_node_image", return_value="private.example/custom:stable"):
+            with self.assertRaisesRegex(RuntimeError, "pull failed"):
+                manager.pull_node_image("/opt/master/docker-compose.yml", "master", "docker compose")
+        self.assertEqual(run.call_count, 1)
+
     def test_pin_rejects_download_tampering_before_creating_an_executable(self):
         with tempfile.TemporaryDirectory() as directory:
             response = mock.MagicMock()

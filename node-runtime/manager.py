@@ -321,6 +321,9 @@ def runtime_override(previous, image, module, budget, core=None):
 def configured_image(compose, base, name):
     probe = "node-runtime-probe-" + uuid.uuid4().hex[:12]
     try:
+        image = configured_node_image(compose, base, name)
+        if command(["docker", "image", "inspect", image], check=False).returncode:
+            pull_node_image(base, name, shlex.join(compose))
         command(compose + ["-f", str(base), "-p", name, "run", "-d", "--rm", "--no-deps", "-T", "--name", probe,
                            "--entrypoint", "python", "marzban-node", "-c", "import time; time.sleep(60)"])
         # Inspect the configured executable with its existing mounts. Updating
@@ -334,6 +337,35 @@ def configured_image(compose, base, name):
         return {"image": inspect_container(probe)["Image"], "core": json.loads(result.stdout)}
     finally:
         command(["docker", "rm", "-f", probe], check=False, timeout=15)
+
+
+def configured_node_image(compose, base, name):
+    arguments = compose + ["-f", str(base), "-p", name, "config"]
+    result = command(arguments + ["--format", "json"], check=False)
+    if result.returncode == 0 and result.stdout.strip():
+        return json.loads(result.stdout)["services"]["marzban-node"]["image"]
+    # Compose v1 has no JSON config mode. Read its normalized service block.
+    text = command(arguments).stdout
+    match = re.search(r"(?ms)^  marzban-node:\n(?P<block>(?:^    .*\n|^\n)+)", text)
+    if match:
+        image = re.search(r"(?m)^    image: (.+)$", match.group("block"))
+        if image:
+            return image.group(1).strip().strip("\"'")
+    raise RuntimeError("Cannot determine the configured node image")
+
+
+def pull_node_image(base, name, compose_string):
+    compose = shlex.split(compose_string)
+    result = command(compose + ["-f", str(base), "-p", name, "pull", "marzban-node"], check=False)
+    if result.returncode == 0:
+        return
+    image = configured_node_image(compose, base, name)
+    if image not in ("gozargah/marzban-node:latest", "docker.io/gozargah/marzban-node:latest"):
+        raise RuntimeError("Configured node image pull failed: " + result.stderr[-1000:])
+    mirror = "ghcr.io/gozargah/marzban-node:latest"
+    print("Docker Hub pull failed; using the official GHCR mirror. Runtime source checks still apply.", file=sys.stderr)
+    command(["docker", "pull", mirror])
+    command(["docker", "tag", mirror, image])
 
 
 def report_core_compatibility(core, name):
@@ -502,6 +534,8 @@ def main(args):
             verify(*args[1:])
         elif args[0] == "remove-idle":
             remove_idle_guard(*args[1:])
+        elif args[0] == "pull":
+            pull_node_image(*args[1:])
         else:
             raise RuntimeError("Unknown runtime operation")
     except Exception as error:
