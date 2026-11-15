@@ -56,6 +56,15 @@ def socket_filter(item):
     return ["src", host, "sport", "=", ":" + str(port), "dst", peer, "dport", "=", ":" + str(peer_port)]
 
 
+def batch_filter(items):
+    result = []
+    for item in items:
+        if result:
+            result.append("or")
+        result.extend(["("] + socket_filter(item) + [")"])
+    return result
+
+
 def owners(container):
     inspected = json.loads(command(["docker", "inspect", container]))[0]
     if inspected["Config"].get("Labels", {}).get("com.docker.compose.service") != "marzban-node":
@@ -106,7 +115,7 @@ def save_state(path, data):
     os.replace(temporary, path)
 
 
-def run(container, state_path, idle_seconds=300, apply=False, limit=100):
+def run(container, state_path, idle_seconds=300, apply=False, limit=2000):
     boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     previous = {}
     now = time.monotonic()
@@ -127,9 +136,19 @@ def run(container, state_path, idle_seconds=300, apply=False, limit=100):
         fresh = snapshot()
         fresh_owned, protected = owners(container)
         selected = eligible(fresh, selected, fresh_owned, protected, idle_seconds)
-        for inode, item in list(selected.items())[:limit]:
-            command(["ss", "-Knt"] + socket_filter(item))
-            attempted += 1
+        targets = list(selected.items())[:limit]
+        for offset in range(0, len(targets), 64):
+            batch = dict(targets[offset:offset + 64])
+            filters = batch_filter(batch.values())
+            # Fail closed if the installed iproute2 interprets a filter more
+            # broadly than the exact, already-owned socket inode set.
+            matches = parse_sockets(command(["ss", "-HtniepO", "state", "established"] + filters))
+            if set(matches) - set(batch):
+                raise RuntimeError("Socket batch filter matched an unexpected inode")
+            confirmed = eligible(matches, batch, fresh_owned, protected, idle_seconds)
+            if confirmed:
+                command(["ss", "-Knt", "state", "established"] + batch_filter(confirmed.values()))
+                attempted += len(confirmed)
         remaining = snapshot()
         closed = sum(inode not in remaining for inode in list(selected)[:limit])
         current = remaining
