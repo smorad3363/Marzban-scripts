@@ -1487,6 +1487,16 @@ fi
     rm "${xray_filename}"
 }
 get_current_xray_core_version() {
+    # The runtime overlay can intentionally select a different executable from
+    # the preserved legacy core and the binary bundled in the container image.
+    if [ -f "$RUNTIME_COMPOSE_FILE" ]; then
+        local runtime_version
+        runtime_version=$(docker exec "$APP_NAME" /opt/marzban-runtime/xray version 2>/dev/null | awk 'NR == 1 && $1 == "Xray" {print $2}')
+        if [ -n "$runtime_version" ]; then
+            echo "$runtime_version (in container)"
+            return
+        fi
+    fi
     XRAY_BINARY="$DATA_MAIN_DIR/xray-core/xray"
     if [ -f "$XRAY_BINARY" ]; then
         version_output=$("$XRAY_BINARY" -version 2>/dev/null)
