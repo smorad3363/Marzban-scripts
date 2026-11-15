@@ -32,6 +32,22 @@ class MasterTests(unittest.TestCase):
     def test_unknown_compose_mount_layout_is_rejected(self):
         with self.assertRaises(ValueError): master_apply.compose_text("services: {}\n", Path("/tmp/fixture"))
 
+    def test_original_master_without_control_mount_is_supported(self):
+        original='services:\n  marzban:\n    volumes:\n      - /data:/var/lib/marzban\n  mysql:\n    volumes:\n      - /db:/var/lib/mysql\n'
+        result=master_apply.compose_text(original,Path('/opt/marzban/master-stability'))
+        self.assertEqual(result.count(':/code/app/xray/node.py:ro'),1)
+        self.assertEqual(result.count(':/code/app/jobs/0_xray_core.py:ro'),1)
+        self.assertIn('  mysql:\n    volumes:\n      - /db:/var/lib/mysql\n',result)
+
+    def test_legacy_control_fixture_is_checksum_gated_and_serialized(self):
+        original=(ROOT/'tests/fixtures/master-node-legacy.original.py').read_text()
+        self.assertEqual(patches.digest(original),patches.LEGACY_NODE_SOURCE_SHA256)
+        result=patches.patch_control(original)
+        self.assertEqual(result.count('@_serialized_node_control'),8)
+        self.assertIn('self._node_control_lock = threading.RLock()',result)
+        self.assertEqual(result.count('timeout=10)'),2)
+        compile(result,'legacy-master.py','exec')
+
     def health(self, node):
         source = patches.patch_health((ROOT / "tests/fixtures/master-health.original.py").read_text())
         tree = ast.parse(source)

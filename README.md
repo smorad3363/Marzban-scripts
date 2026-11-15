@@ -115,8 +115,13 @@ kernel's orphaned FIN timeout does not reliably release those application-owned
 descriptors. Half-closed sockets with queued payload are retained.
 
 The host profile enables TCP MTU probing, keeps stricter existing keepalive
-settings, limits the default established conntrack timeout to two hours, disables
-router redirects and increases undersized conntrack tables according to RAM.
+settings, limits the default established conntrack timeout to two hours and disables
+router redirects. Default conntrack budgets are 32768 below 3 GiB RAM, 65536
+below 7 GiB, and 131072 on larger hosts. An existing sensible smaller table is
+retained. Oversized tables are reduced only with 25% free capacity around the
+current entry count; busy hosts can temporarily retain a larger kernel table.
+Existing flows are never flushed. The count is sampled again immediately before
+applying a reduction, rather than relying on the pre-download snapshot.
 It does not change interface MTU, routes, DNS, congestion control or firewall
 policy. Multiple node instances are serialized with one host-wide installer lock.
 The 75% Go budget is per instance and is not a reservation; several busy instances
@@ -132,6 +137,40 @@ recreating the node. Runtime backups are stored under
 runtime and image. Unsupported future module versions are rejected before the
 running node is stopped. The master-side fixes tested separately are not applied
 to a different master by this node installer.
+
+### Connection admission budget
+
+The installer enables one host-wide `marzban-node-admission.service`. Every two
+seconds it reads the local conntrack count. At 75% of the smaller kernel limit
+and configured budget it temporarily rejects **new TCP SYNs only**, on public
+listeners owned by Xray in host-network Marzban-node containers. At 60% it
+reopens admission. Listener ownership is refreshed periodically. SSH, node
+control/API ports, loopback, established TCP sessions and UDP remain unchanged.
+IPv4 and IPv6 use dedicated owned chains; unrelated firewall rules are retained.
+Stopping or failing the service removes its gate. Multiple node instances share
+one controller and one host budget. Bridge-mode nodes are not gated by this
+host INPUT controller.
+
+An optional `/etc/marzban-node/connection-budget.json` sets a lower operator
+budget, for example:
+
+```json
+{"tracked_budget": 50000, "pause_percent": 75, "resume_percent": 60}
+```
+
+The default budget uses the RAM tiers above. Status, selected data ports and
+thresholds are recorded in `/run/marzban-node-admission.json`. Changes are
+validated and read during operation. Invalid settings stop the controller and
+clear its gate rather than leaving a stale rejection rule.
+
+This is admission backpressure, not a strict provider-side connection limit.
+An upstream host can already have tracked a SYN before the guest rejects it;
+the two-second sampling interval can also overshoot. Existing sessions, their
+new outbound flows, UDP, other services and other VPSs are outside this gate.
+For a guaranteed provider limit, coordinate upstream enforcement and obtain the
+actual provider budget. A warning reporting 242000 tracked entries is not itself
+a published per-VPS allowance. This feature does not change interface MTU/MSS
+or block UDP.
 
 ### Legacy master connection stability
 

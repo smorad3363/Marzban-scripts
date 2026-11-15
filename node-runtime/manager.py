@@ -37,6 +37,43 @@ PINNED_CORE_ASSETS = {
 IDLE_GUARD_SOURCE = '#!/usr/bin/env python3\n"""Reap confirmed idle TCP sockets owned by one selected node container.\n\nKernel data-idle timers, two byte-counter snapshots, inode ownership and a final\nrescan are required. No conntrack table is flushed and no process is killed.\n"""\nimport argparse\nimport json\nimport os\nfrom pathlib import Path\nimport re\nimport subprocess\nimport time\n\n\ndef command(args):\n    return subprocess.run(args, text=True, capture_output=True, check=True, timeout=20).stdout\n\n\ndef endpoint(value):\n    host, port = value.rsplit(":", 1)\n    return host.strip("[]"), int(port)\n\n\ndef parse_sockets(output):\n    result = {}\n    for line in output.splitlines():\n        parts = line.split()\n        if len(parts) < 4:\n            continue\n        try:\n            queues = [int(parts[0]), int(parts[1])]\n            local, peer = endpoint(parts[2]), endpoint(parts[3])\n        except ValueError:\n            continue\n        values = {k: int(v) for k, v in re.findall(r"\\b(ino|bytes_sent|bytes_received|lastsnd|lastrcv):(\\d+)", line)}\n        if not values.get("ino") or "lastsnd" not in values or "lastrcv" not in values:\n            continue\n        inode = str(values["ino"])\n        result[inode] = {"local": local, "peer": peer, "bytes": [values.get("bytes_sent", 0), values.get("bytes_received", 0)],\n                         "idle_ms": min(values["lastsnd"], values["lastrcv"]), "queues": queues}\n    return result\n\n\ndef snapshot():\n    result = {}\n    # An application-owned half-close is not covered by the kernel\'s orphaned\n    # FIN-WAIT timeout. Reap confirmed idle half-closes before open sessions.\n    for state in ("fin-wait-2", "close-wait", "established"):\n        sockets = parse_sockets(command(["ss", "-HtniepO", "state", state]))\n        for item in sockets.values():\n            item["state"] = state\n        result.update(sockets)\n    return result\n\n\ndef socket_filter(item):\n    host, port = item["local"]\n    peer, peer_port = item["peer"]\n    # iproute2 treats an unbracketed IPv6 suffix as a port, including\n    # IPv4-mapped addresses returned for dual-stack Xray listeners.\n    host = "[" + host + "]" if ":" in host else host\n    peer = "[" + peer + "]" if ":" in peer else peer\n    return ["src", host, "sport", "=", ":" + str(port), "dst", peer, "dport", "=", ":" + str(peer_port)]\n\n\ndef batch_filter(items):\n    result = []\n    for item in items:\n        if result:\n            result.append("or")\n        result.extend(["("] + socket_filter(item) + [")"])\n    return result\n\n\ndef owners(container):\n    inspected = json.loads(command(["docker", "inspect", container]))[0]\n    if inspected["Config"].get("Labels", {}).get("com.docker.compose.service") != "marzban-node":\n        raise RuntimeError("Selected container is not a Marzban node")\n    env = dict(x.split("=", 1) for x in inspected["Config"].get("Env", []) if "=" in x)\n    protected = {22, 6111, int(env.get("SERVICE_PORT", 62050)), int(env.get("XRAY_API_PORT", 62051))}\n    inodes = set()\n    for line in command(["docker", "top", container, "-eo", "pid,comm"]).splitlines()[1:]:\n        parts = line.split()\n        if len(parts) != 2 or parts[1] != "xray":\n            continue\n        try:\n            for descriptor in Path("/proc", parts[0], "fd").iterdir():\n                try:\n                    link = os.readlink(descriptor)\n                    match = re.fullmatch(r"socket:\\[(\\d+)\\]", link)\n                    if match:\n                        inodes.add(match[1])\n                except OSError:\n                    pass\n        except OSError:\n            pass\n    return inodes, protected\n\n\ndef eligible(current, previous, owned, protected, idle_seconds):\n    selected = {}\n    for inode, item in current.items():\n        before = previous.get(inode)\n        receive, send = item["queues"]\n        # CLOSE-WAIT\'s final FIN can occupy one sequence byte without payload.\n        empty = send == 0 and (receive == 0 or item.get("state") == "close-wait" and receive == 1)\n        if inode not in owned or before is None or not empty:\n            continue\n        if item["local"][1] in protected or item["peer"][1] in protected:\n            continue\n        if item["idle_ms"] < idle_seconds * 1000:\n            continue\n        if any(item[k] != before[k] for k in ("local", "peer", "bytes")):\n            continue\n        selected[inode] = item\n    return selected\n\n\ndef save_state(path, data):\n    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)\n    temporary = path.with_name(path.name + ".tmp")\n    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)\n    with os.fdopen(descriptor, "w") as stream:\n        json.dump(data, stream)\n    os.replace(temporary, path)\n\n\ndef run(container, state_path, idle_seconds=300, apply=False, limit=2000):\n    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()\n    previous = {}\n    now = time.monotonic()\n    if state_path.exists():\n        state = json.loads(state_path.read_text())\n        # JSON round trips lists; normalise addresses before comparisons.\n        if state.get("boot") == boot and state.get("container") == container and 30 <= now - state.get("time", now) <= 180:\n            previous = state.get("sockets", {})\n            for value in previous.values():\n                value["local"] = tuple(value["local"])\n                value["peer"] = tuple(value["peer"])\n    current = snapshot()\n    owned, protected = owners(container)\n    selected = eligible(current, previous, owned, protected, idle_seconds)\n    attempted = 0\n    if apply and selected:\n        # Recheck data progress and ownership immediately before socket destroy.\n        fresh = snapshot()\n        fresh_owned, protected = owners(container)\n        selected = eligible(fresh, selected, fresh_owned, protected, idle_seconds)\n        targets = list(selected.items())[:limit]\n        for offset in range(0, len(targets), 64):\n            for state in ("fin-wait-2", "close-wait", "established"):\n                batch = {k: v for k, v in targets[offset:offset + 64] if v.get("state", "established") == state}\n                if not batch:\n                    continue\n                filters = batch_filter(batch.values())\n                # Fail closed if iproute2 matches an unexpected socket inode.\n                matches = parse_sockets(command(["ss", "-HtniepO", "state", state] + filters))\n                for item in matches.values(): item["state"] = state\n                if set(matches) - set(batch):\n                    raise RuntimeError("Socket batch filter matched an unexpected inode")\n                confirmed = eligible(matches, batch, fresh_owned, protected, idle_seconds)\n                if confirmed:\n                    command(["ss", "-Knt", "state", state] + batch_filter(confirmed.values()))\n                    attempted += len(confirmed)\n        remaining = snapshot()\n        closed = sum(inode not in remaining for inode in list(selected)[:limit])\n        current = remaining\n    else:\n        closed = 0\n    # Store node sockets only. Never retain other services\' endpoint inventory.\n    save_state(state_path, {"boot": boot, "container": container, "time": now, "sockets": {k: v for k, v in current.items() if k in owned}})\n    return {"container": container, "apply": apply, "idle_seconds": idle_seconds, "owned_tcp": len(set(current) & owned),\n            "confirmed_idle": len(selected), "attempted": attempted, "closed": closed}\n\n\nif __name__ == "__main__":\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument("--container", required=True)\n    parser.add_argument("--state", required=True, type=Path)\n    parser.add_argument("--idle-seconds", type=int, default=300)\n    parser.add_argument("--apply", action="store_true")\n    args = parser.parse_args()\n    if args.idle_seconds < 300:\n        parser.error("Production idle timeout must be at least 300 seconds")\n    print(json.dumps(run(args.container, args.state, args.idle_seconds, args.apply)))\n'
 # END EMBEDDED IDLE GUARD
 
+# BEGIN EMBEDDED CONNECTION GUARD
+CONNECTION_GUARD_SOURCE = '#!/usr/bin/env python3\n"""Pause new node TCP sessions under local conntrack pressure.\n\nOnly public TCP listeners owned by Xray in Marzban-node containers are gated.\nThis is local admission control, not a limit on a provider\'s upstream table.\n"""\nimport argparse\nimport fcntl\nimport ipaddress\nimport json\nimport os\nfrom pathlib import Path\nimport re\nimport shutil\nimport signal\nimport subprocess\nimport time\n\nPOLICY = Path(\'/etc/marzban-node/connection-budget.json\')\nSTATUS = Path(\'/run/marzban-node-admission.json\')\nCHAIN = \'MZN_ADMIT\'\nMARKER = \'marzban-node-budget-v1\'\nHOOK = [\'-m\', \'comment\', \'--comment\', MARKER, \'-j\', CHAIN]\n\n\ndef run(args, check=True, **kwargs):\n    return subprocess.run(args, text=True, capture_output=True, check=check, timeout=15, **kwargs)\n\n\ndef default_budget():\n    memory = next(int(line.split()[1]) * 1024 for line in Path(\'/proc/meminfo\').read_text().splitlines() if line.startswith(\'MemTotal:\'))\n    return 32768 if memory < 3 * 1024**3 else 65536 if memory < 7 * 1024**3 else 131072\n\n\ndef policy(path=POLICY):\n    value = json.loads(path.read_text()) if path.exists() else {}\n    if set(value) - {\'tracked_budget\', \'pause_percent\', \'resume_percent\'}:\n        raise ValueError(\'Unknown connection-budget setting\')\n    budget = value.get(\'tracked_budget\', default_budget())\n    pause, resume = value.get(\'pause_percent\', 75), value.get(\'resume_percent\', 60)\n    if type(budget) is not int or not 1024 <= budget <= 1048576:\n        raise ValueError(\'tracked_budget must be an integer from 1024 to 1048576\')\n    if any(type(x) is not int for x in (pause, resume)) or not 10 <= resume < pause <= 90:\n        raise ValueError(\'Require 10 <= resume_percent < pause_percent <= 90\')\n    return budget, pause, resume\n\n\ndef pressure(count, maximum, settings, paused=False):\n    budget, high, low = settings\n    budget = min(maximum, budget)\n    if count < 0 or budget < 1:\n        raise ValueError(\'Invalid conntrack counters\')\n    paused = count > budget * low // 100 if paused else count >= budget * high // 100\n    return paused, budget\n\n\ndef listener_ports(output, pids, protected):\n    ports = set()\n    for line in output.splitlines():\n        if not (pids & {int(v) for v in re.findall(r\'pid=(\\d+)\', line)}):\n            continue\n        parts = line.split()\n        if len(parts) < 5:\n            continue\n        try:\n            host, port = parts[3].rsplit(\':\', 1)\n            port = int(port)\n            host = host.strip(\'[]\').split(\'%\', 1)[0]\n            if host != \'*\':\n                address = ipaddress.ip_address(host)\n                if address.is_loopback or getattr(address, \'ipv4_mapped\', None) and address.ipv4_mapped.is_loopback:\n                    continue\n            if 1 <= port <= 65535 and port not in protected:\n                ports.add(port)\n        except ValueError:\n            continue\n    return ports\n\n\ndef discover_ports():\n    names = run([\'docker\', \'ps\', \'--filter\', \'label=com.docker.compose.service=marzban-node\', \'--format\', \'{{.Names}}\']).stdout.splitlines()\n    pids, protected = set(), {22, 6111}\n    for name in names:\n        info = json.loads(run([\'docker\', \'inspect\', name]).stdout)[0]\n        # Bridge-mode container ports do not traverse the host INPUT chain.\n        if info.get(\'HostConfig\', {}).get(\'NetworkMode\') != \'host\':\n            continue\n        env = dict(x.split(\'=\', 1) for x in info[\'Config\'].get(\'Env\', []) if \'=\' in x)\n        protected.update(int(env.get(key, default)) for key, default in [(\'SERVICE_PORT\', \'62050\'), (\'XRAY_API_PORT\', \'62051\')])\n        top = run([\'docker\', \'top\', name, \'-eo\', \'pid,comm\']).stdout\n        for line in top.splitlines()[1:]:\n            parts = line.split()\n            if len(parts) == 2 and parts[1] == \'xray\':\n                pids.add(int(parts[0]))\n    # Protect SSH even when its configured port differs from 22 or 6111.\n    output = run([\'ss\', \'-Hlntp\']).stdout\n    for line in output.splitlines():\n        if \'"sshd"\' in line or \'"sshd-session"\' in line:\n            try: protected.add(int(line.split()[3].rsplit(\':\', 1)[1]))\n            except (IndexError, ValueError): pass\n    return listener_ports(output, pids, protected)\n\n\ndef rules(ports, paused):\n    lines = [\'*filter\', \':\' + CHAIN + \' - [0:0]\', \'-F \' + CHAIN]\n    ports = sorted(set(ports) - {22, 6111})\n    if any(type(p) is not int or not 1 <= p <= 65535 for p in ports):\n        raise ValueError(\'Invalid data port\')\n    if paused:\n        for offset in range(0, len(ports), 15):\n            selected = \',\'.join(map(str, ports[offset:offset + 15]))\n            lines.append(\'-A \' + CHAIN + \' ! -i lo -p tcp --syn -m conntrack --ctstate NEW -m multiport --dports \' + selected + \' -j REJECT --reject-with tcp-reset\')\n    lines += [\'-A \' + CHAIN + \' -m comment --comment \' + MARKER + \' -j RETURN\', \'COMMIT\', \'\']\n    return \'\\n\'.join(lines)\n\n\nclass Firewall:\n    def __init__(self, families=None):\n        if families is None:\n            families = [\'iptables\']\n            if Path(\'/proc/net/if_inet6\').exists() and Path(\'/proc/net/if_inet6\').read_text().strip():\n                families.append(\'ip6tables\')\n        self.families = families\n        self.last = None\n\n    def check_owner(self, binary):\n        result = run([binary, \'-w\', \'5\', \'-S\', CHAIN], check=False)\n        if result.returncode == 0 and MARKER not in result.stdout:\n            raise RuntimeError(\'Refusing to change an unowned firewall chain\')\n        return result.returncode == 0\n\n    def apply(self, ports, paused):\n        key = (tuple(sorted(ports)), paused)\n        if self.last == key:\n            return\n        for binary in self.families:\n            if not shutil.which(binary) or not shutil.which(binary + \'-restore\'):\n                raise RuntimeError(\'Node admission needs \' + binary)\n            self.check_owner(binary)\n            # --noflush leaves every other chain, table and rule unchanged.\n            run([binary + \'-restore\', \'-w\', \'5\', \'--noflush\'], input=rules(ports, paused))\n            if run([binary, \'-w\', \'5\', \'-C\', \'INPUT\'] + HOOK, check=False).returncode:\n                run([binary, \'-w\', \'5\', \'-I\', \'INPUT\', \'1\'] + HOOK)\n        self.last = key\n\n    def clear(self):\n        errors = []\n        for binary in dict.fromkeys(self.families + [\'iptables\', \'ip6tables\']):\n            try:\n                if not shutil.which(binary) or not self.check_owner(binary):\n                    continue\n                while run([binary, \'-w\', \'5\', \'-C\', \'INPUT\'] + HOOK, check=False).returncode == 0:\n                    run([binary, \'-w\', \'5\', \'-D\', \'INPUT\'] + HOOK)\n                run([binary, \'-w\', \'5\', \'-F\', CHAIN])\n                run([binary, \'-w\', \'5\', \'-X\', CHAIN])\n            except Exception as exc:\n                errors.append(str(exc))\n        self.last = None\n        if errors:\n            raise RuntimeError(\'; \'.join(errors))\n\n\ndef counters():\n    root = Path(\'/proc/sys/net/netfilter\')\n    return int((root / \'nf_conntrack_count\').read_text()), int((root / \'nf_conntrack_max\').read_text())\n\n\ndef serve():\n    firewall = Firewall()\n    paused, ports, refresh = False, set(), 0\n    def stop(*_): raise KeyboardInterrupt\n    signal.signal(signal.SIGTERM, stop)\n    signal.signal(signal.SIGINT, stop)\n    try:\n        while True:\n            now = time.monotonic()\n            settings = policy()\n            count, maximum = counters()\n            next_paused, budget = pressure(count, maximum, settings, paused)\n            if now >= refresh or next_paused != paused:\n                ports = discover_ports()\n                refresh = now + 15\n            firewall.apply(ports, next_paused)\n            state = {\'pid\': os.getpid(), \'count\': count, \'kernel_max\': maximum, \'budget\': budget, \'paused\': bool(ports and next_paused),\n                     \'data_ports\': sorted(ports), \'pause_at\': budget * settings[1] // 100,\n                     \'resume_at\': budget * settings[2] // 100, \'sample_unix\': time.time()}\n            if next_paused != paused:\n                print(json.dumps(state), flush=True)\n            STATUS.write_text(json.dumps(state) + \'\\n\')\n            STATUS.chmod(0o600)\n            paused = next_paused\n            time.sleep(2)\n    except KeyboardInterrupt:\n        pass\n    finally:\n        firewall.clear()\n        STATUS.unlink(missing_ok=True)\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument(\'--clear\', action=\'store_true\')\n    args = parser.parse_args()\n    # A second service/installer must not replace a gate while the daemon runs.\n    with open(\'/run/marzban-node-admission.lock\', \'a\') as lock:\n        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)\n        if args.clear:\n            Firewall().clear()\n            STATUS.unlink(missing_ok=True)\n        else:\n            serve()\n\n\nif __name__ == \'__main__\':\n    main()\n'
+# END EMBEDDED CONNECTION GUARD
+
+
+def connection_paths():
+    return {'admission_script': Path('/usr/local/lib/marzban-node/connection_guard.py'),
+            'admission_service': Path('/etc/systemd/system/marzban-node-admission.service')}
+
+
+def connection_settings():
+    namespace = {'__name__': 'node_admission'}
+    exec(compile(CONNECTION_GUARD_SOURCE, 'connection_guard.py', 'exec'), namespace)
+    return namespace['policy']()
+
+
+def install_connection_guard(state):
+    unit = Path(state['admission_service']).name
+    command(['systemctl', 'stop', unit], check=False)
+    script = Path(state['admission_script'])
+    script.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(script, CONNECTION_GUARD_SOURCE, 0o700)
+    atomic_write(Path(state['admission_service']), '[Unit]\nDescription=Marzban node connection admission\nAfter=docker.service\n[Service]\nType=simple\nExecStart=/usr/bin/python3 ' + str(script) + '\nExecStopPost=/usr/bin/python3 ' + str(script) + ' --clear\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=15\nUMask=0077\n[Install]\nWantedBy=multi-user.target\n', 0o644)
+    command(['systemctl', 'daemon-reload'])
+    command(['systemctl', 'enable', '--now', unit])
+    for _ in range(10):
+        if command(['systemctl', 'is-active', unit], check=False).returncode == 0 and Path('/run/marzban-node-admission.json').exists():
+            try:
+                status = json.loads(Path('/run/marzban-node-admission.json').read_text())
+                pid = int(command(['systemctl', 'show', unit, '--property=MainPID', '--value']).stdout.strip())
+                if status['pid'] == pid and time.time() - status['sample_unix'] < 15:
+                    return
+            except (KeyError, ValueError, OSError):
+                pass
+        time.sleep(1)
+    raise RuntimeError('Node admission guard did not become ready')
+
 
 def guard_paths(data, name):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name):
@@ -65,6 +102,13 @@ def remove_idle_guard(name):
     command(["systemctl", "disable", "--now", paths["guard_timer"].name], check=False)
     for label in ("guard_timer", "guard_service"):
         paths[label].unlink(missing_ok=True)
+    remaining = command(['docker', 'ps', '-a', '--filter', 'label=com.docker.compose.service=marzban-node', '--format', '{{.Names}}'], check=False)
+    if remaining.returncode == 0 and not (set(remaining.stdout.splitlines()) - {name}):
+        paths = connection_paths()
+        unit = paths['admission_service'].name
+        command(['systemctl', 'disable', '--now', unit], check=False)
+        for path in paths.values():
+            path.unlink(missing_ok=True)
     command(["systemctl", "daemon-reload"], check=False)
 
 
@@ -75,7 +119,7 @@ def network_plan():
     requested = dict(limits, **{"net.ipv4.tcp_mtu_probing": 1,
                                "net.ipv4.conf.all.send_redirects": 0,
                                "net.ipv4.conf.default.send_redirects": 0})
-    requested["net.netfilter.nf_conntrack_max"] = min(262144, max(32768, effective_memory() // (1024**3) * 32768))
+    requested["net.netfilter.nf_conntrack_max"] = connection_settings()[0]
     old, new = {}, {}
     for key, value in requested.items():
         probe = command(["sysctl", "-n", key], check=False)
@@ -83,7 +127,20 @@ def network_plan():
             continue
         current = int(probe.stdout.strip())
         old[key] = str(current)
-        new[key] = str(min(current, value) if key in limits else max(current, value) if key in ("net.netfilter.nf_conntrack_max", "net.ipv4.tcp_mtu_probing") else value)
+        if key == 'net.netfilter.nf_conntrack_max':
+            # Keep an existing sensible smaller table. When shrinking, retain
+            # 25% free capacity for the live count; never flush existing flows.
+            target = min(current, value) if current >= 32768 else value
+            sample = command(['sysctl', '-n', 'net.netfilter.nf_conntrack_count'], check=False)
+            if sample.returncode or not sample.stdout.strip().isdigit():
+                target = max(current, target)
+            else:
+                count = int(sample.stdout.strip())
+                if target < current:
+                    target = max(target, min(current, (count * 4 + 2) // 3))
+            new[key] = str(target)
+        else:
+            new[key] = str(min(current, value) if key in limits else max(current, value) if key == 'net.ipv4.tcp_mtu_probing' else value)
     return old, new
 
 RUNTIME_METHOD = '''    def _apply_runtime_limits(self):
@@ -439,11 +496,13 @@ def prepare(base, overlay, data, name, compose_string):
              "old_restart_count": old_container["RestartCount"] if old_container else 0,
              "was_running": bool(old_container and old_container["State"]["Running"]),
              "budget": budget, "image": image, "backup": str(backup), "memory_limit": configured.get("memory_limit", 0)}
-    paths = dict(guard_paths(data, name), rest_module=rest_module, network_profile=Path("/etc/sysctl.d/93-marzban-node-network.conf"))
+    paths = dict(guard_paths(data, name), **connection_paths(), rest_module=rest_module, network_profile=Path("/etc/sysctl.d/93-marzban-node-network.conf"))
     state.update({key: str(value) for key, value in paths.items()})
     state["network_old"], state["network_new"] = network_plan()
     state["guard_enabled"] = command(["systemctl", "is-enabled", paths["guard_timer"].name], check=False).returncode == 0
     state["guard_active"] = command(["systemctl", "is-active", paths["guard_timer"].name], check=False).returncode == 0
+    state['admission_enabled'] = command(['systemctl', 'is-enabled', paths['admission_service'].name], check=False).returncode == 0
+    state['admission_active'] = command(['systemctl', 'is-active', paths['admission_service'].name], check=False).returncode == 0
     for label, path in [("overlay", overlay), ("module", module)] + list(paths.items()):
         state[label + "_existed"] = path.exists()
         if path.exists():
@@ -468,7 +527,9 @@ def prepare(base, overlay, data, name, compose_string):
 
 
 def restore_files(state):
-    for label in ("module", "overlay", "guard", "guard_service", "guard_timer", "rest_module", "network_profile"):
+    for label in ("module", "overlay", "guard", "guard_service", "guard_timer", "rest_module", "network_profile", 'admission_script', 'admission_service'):
+        if label not in state:
+            continue
         target = Path(state[label])
         if state[label + "_existed"]:
             backup = Path(state["backup"]) / label
@@ -484,12 +545,19 @@ def rollback(statefile, compose_string):
     state = json.loads(Path(statefile).read_text())
     timer = Path(state["guard_timer"]).name
     command(["systemctl", "stop", timer], check=False)
+    if 'admission_service' in state:
+        admission = Path(state['admission_service']).name
+        command(['systemctl', 'stop', admission], check=False)
+        if not state.get('admission_enabled'):
+            command(['systemctl', 'disable', admission], check=False)
     if not state["guard_enabled"]:
         command(["systemctl", "disable", timer], check=False)
     restore_files(state)
     for key, value in state["network_old"].items():
         command(["sysctl", "-w", key + "=" + value], check=False)
     command(["systemctl", "daemon-reload"], check=False)
+    if state.get('admission_active'):
+        command(['systemctl', 'start', admission], check=False)
     if state["guard_active"]:
         command(["systemctl", "start", timer], check=False)
     compose = shlex.split(compose_string)
@@ -526,6 +594,11 @@ def verify(statefile):
     if not version.startswith("Xray " + PINNED_CORE_VERSION + " "):
         raise RuntimeError("Running node core does not match the verified version pin")
     install_idle_guard(state)
+    install_connection_guard(state)
+    # Preparation may have taken minutes. Re-sample before shrinking a live
+    # table, while retaining the original values in the rollback manifest.
+    _, state['network_new'] = network_plan()
+    atomic_write(Path(statefile), json.dumps(state, indent=2) + '\n')
     if state["network_new"]:
         atomic_write(state["network_profile"], "# Marzban defaults; installation rollback retains prior values.\n" + "".join(key + " = " + value + "\n" for key, value in state["network_new"].items()), 0o644)
         command(["sysctl", "-p", state["network_profile"]])

@@ -132,6 +132,7 @@ class MigrationTests(unittest.TestCase):
                       mock.patch.object(manager, "stage_pinned_core", return_value=self.data / "pinned/xray"),
                       mock.patch.object(manager, "guard_paths", return_value={"guard": self.data / "idle_guard.py", "guard_service": self.root / "idle.service", "guard_timer": self.root / "idle.timer"}),
                       mock.patch.object(manager, "network_plan", return_value=({}, {})),
+                      mock.patch.object(manager, 'connection_paths', return_value={'admission_script': self.data / 'admission.py', 'admission_service': self.root / 'admission.service'}),
                       mock.patch.object(manager, "effective_memory", return_value=8 * 1024**3)]:
             patch.start()
             self.addCleanup(patch.stop)
@@ -253,16 +254,31 @@ class ContractTests(unittest.TestCase):
                     manager.stage_pinned_core(directory)
             self.assertFalse((Path(directory) / "node-runtime-core").exists())
 
-    def test_network_profile_keeps_stricter_timeouts_and_larger_tables(self):
+    def test_network_profile_keeps_stricter_timeouts_but_bounds_oversized_tables(self):
         current = {"net.ipv4.tcp_keepalive_time": "60", "net.ipv4.tcp_keepalive_intvl": "10", "net.ipv4.tcp_keepalive_probes": "3",
                    "net.netfilter.nf_conntrack_tcp_timeout_established": "600", "net.netfilter.nf_conntrack_max": "524288", "net.ipv4.tcp_mtu_probing": "2"}
         def probe(args, **kwargs):
             return subprocess.CompletedProcess(args, 0, current.get(args[-1], "1") + "\n", "")
         with mock.patch.object(manager, "command", side_effect=probe), mock.patch.object(manager, "effective_memory", return_value=2 * 1024**3):
-            old, new = manager.network_plan()
+            with mock.patch.object(manager, 'connection_settings', return_value=(32768, 75, 60)):
+                old, new = manager.network_plan()
         for key, value in current.items():
-            self.assertEqual(new[key], value)
+            self.assertEqual(new[key], '32768' if key == 'net.netfilter.nf_conntrack_max' else value)
         self.assertEqual(new["net.ipv4.conf.all.send_redirects"], "0")
+
+    def test_network_shrink_retains_headroom_for_busy_table(self):
+        values = {'net.netfilter.nf_conntrack_max': '262144', 'net.netfilter.nf_conntrack_count': '150000'}
+        def probe(args, **kwargs): return subprocess.CompletedProcess(args, 0, values.get(args[-1], '1'), '')
+        with mock.patch.object(manager, 'command', side_effect=probe), mock.patch.object(manager, 'connection_settings', return_value=(65536, 75, 60)):
+            _, new = manager.network_plan()
+        self.assertEqual(new['net.netfilter.nf_conntrack_max'], '200000')
+
+    def test_network_does_not_raise_an_existing_sensible_smaller_table(self):
+        values = {'net.netfilter.nf_conntrack_max': '65536', 'net.netfilter.nf_conntrack_count': '1000'}
+        def probe(args, **kwargs): return subprocess.CompletedProcess(args, 0, values.get(args[-1], '1'), '')
+        with mock.patch.object(manager, 'command', side_effect=probe), mock.patch.object(manager, 'connection_settings', return_value=(131072, 75, 60)):
+            _, new = manager.network_plan()
+        self.assertEqual(new['net.netfilter.nf_conntrack_max'], '65536')
 
     def test_legacy_core_warning_does_not_claim_soft_memory_budget_fixes_ss2022(self):
         for version in ("Xray 26.3.27 (Xray)", "Xray 26.9.9", "Xray 1.8.24", "custom core", ""):
