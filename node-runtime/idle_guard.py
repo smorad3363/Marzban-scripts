@@ -12,6 +12,10 @@ import re
 import subprocess
 import time
 
+SOCKET_STATES = ("fin-wait-2", "close-wait", "established")
+# Inodes and TCP counters come from ss; owners() verifies process ownership.
+SOCKET_DETAILS = ["ss", "-HtnieO"]
+
 
 def command(args):
     return subprocess.run(args, text=True, capture_output=True, check=True, timeout=20).stdout
@@ -46,8 +50,8 @@ def snapshot():
     result = {}
     # An application-owned half-close is not covered by the kernel's orphaned
     # FIN-WAIT timeout. Reap confirmed idle half-closes before open sessions.
-    for state in ("fin-wait-2", "close-wait", "established"):
-        sockets = parse_sockets(command(["ss", "-HtniepO", "state", state]))
+    for state in SOCKET_STATES:
+        sockets = parse_sockets(command([*SOCKET_DETAILS, "state", state]))
         for item in sockets.values():
             item["state"] = state
         result.update(sockets)
@@ -148,14 +152,13 @@ def run(container, state_path, idle_seconds=300, apply=False, limit=2000):
         fresh_owned, protected = owners(container)
         selected = eligible(fresh, selected, fresh_owned, protected, idle_seconds)
         targets = list(selected.items())[:limit]
-        for offset in range(0, len(targets), 64):
-            for state in ("fin-wait-2", "close-wait", "established"):
-                batch = {k: v for k, v in targets[offset:offset + 64] if v.get("state", "established") == state}
-                if not batch:
-                    continue
+        for state in SOCKET_STATES:
+            state_targets = [(inode, item) for inode, item in targets if item["state"] == state]
+            for offset in range(0, len(state_targets), 64):
+                batch = dict(state_targets[offset:offset + 64])
                 filters = batch_filter(batch.values())
                 # Fail closed if iproute2 matches an unexpected socket inode.
-                matches = parse_sockets(command(["ss", "-HtniepO", "state", state] + filters))
+                matches = parse_sockets(command([*SOCKET_DETAILS, "state", state, *filters]))
                 for item in matches.values(): item["state"] = state
                 if set(matches) - set(batch):
                     raise RuntimeError("Socket batch filter matched an unexpected inode")
