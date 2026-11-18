@@ -44,6 +44,7 @@ jobs:
       - name: Check syntax, unchanged CLI contract, preservation and rollback
         run: |
           python3 tests/test_node_runtime.py
+          python3 tests/test_node_runtime_health.py
           python3 tests/test_node_idle_guard.py
           python3 tests/test_node_connection_guard.py
           python3 tests/test_master_runtime.py

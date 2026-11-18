@@ -290,7 +290,16 @@ os.execv(os.environ['NODE_TEST_REAL_INSTALL'],[os.environ['NODE_TEST_REAL_INSTAL
                 process.stdin.close()
                 try:
                     wait_port(62050, timeout=240)
-                    time.sleep(5)
+                    history = Path("/var/log/marzban-node-health/samples.jsonl")
+                    deadline = time.monotonic() + 60
+                    while not history.exists() and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(.5)
+                    if not history.exists():
+                        raise RuntimeError("Node installer did not start performance history")
+                    sample = json.loads(history.read_text().splitlines()[-1])
+                    assert sample["cpu_ticks"] and "Tcp" in sample["protocols"]
+                    assert history.stat().st_mode & 0o077 == 0
+                    time.sleep(2)
                 finally:
                     if process.poll() is None:
                         os.killpg(process.pid, signal.SIGINT)
@@ -299,6 +308,9 @@ os.execv(os.environ['NODE_TEST_REAL_INSTALL'],[os.environ['NODE_TEST_REAL_INSTAL
                     log.seek(0)
                     raise RuntimeError(log.read()[-6000:])
             assert (APP / "docker-compose.runtime.json").is_file()
+            log_config = inspect()["HostConfig"]["LogConfig"]
+            if log_config["Type"] == "json-file":
+                assert log_config["Config"].get("max-size", "-1") != "-1"
             check_runtime_and_data(cert, key, origin)
             check_half_closed_socket()
 
