@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pause new node TCP sessions under local conntrack pressure.
+"""Pause new node TCP sessions under local conntrack or memory pressure.
 
 Only public TCP listeners owned by Xray in Marzban-node containers are gated.
 This is local admission control, not a limit on a provider's upstream table.
@@ -21,6 +21,7 @@ STATUS = Path('/run/marzban-node-admission.json')
 CHAIN = 'MZN_ADMIT'
 MARKER = 'marzban-node-budget-v1'
 HOOK = ['-m', 'comment', '--comment', MARKER, '-j', CHAIN]
+MEMORY_HOLD_SECONDS = 8
 
 
 def run(args, check=True, **kwargs):
@@ -32,17 +33,50 @@ def default_budget():
     return 32768 if memory < 3 * 1024**3 else 65536 if memory < 7 * 1024**3 else 131072
 
 
-def policy(path=POLICY):
+def read_policy(path=POLICY):
     value = json.loads(path.read_text()) if path.exists() else {}
-    if set(value) - {'tracked_budget', 'pause_percent', 'resume_percent'}:
+    if not isinstance(value, dict) or set(value) - {'tracked_budget', 'pause_percent', 'resume_percent', 'memory'}:
         raise ValueError('Unknown connection-budget setting')
-    budget = value.get('tracked_budget', default_budget())
+    budget = value['tracked_budget'] if 'tracked_budget' in value else default_budget()
     pause, resume = value.get('pause_percent', 75), value.get('resume_percent', 60)
     if type(budget) is not int or not 1024 <= budget <= 1048576:
         raise ValueError('tracked_budget must be an integer from 1024 to 1048576')
     if any(type(x) is not int for x in (pause, resume)) or not 10 <= resume < pause <= 90:
         raise ValueError('Require 10 <= resume_percent < pause_percent <= 90')
-    return budget, pause, resume
+    memory = value.get('memory')
+    if memory is not None:
+        keys = ('pause_available_mib', 'resume_available_mib')
+        if not isinstance(memory, dict) or set(memory) != set(keys):
+            raise ValueError('Memory admission needs pause_available_mib and resume_available_mib')
+        memory = tuple(memory[key] for key in keys)
+        if any(type(x) is not int for x in memory) or not 128 <= memory[0] < memory[1]:
+            raise ValueError('Memory admission requires integer MiB limits with 128 <= pause < resume')
+    return (budget, pause, resume), memory
+
+
+def policy(path=POLICY):
+    return read_policy(path)[0]
+
+
+def memory_available():
+    for line in Path('/proc/meminfo').read_text().splitlines():
+        if line.startswith('MemAvailable:'):
+            return int(line.split()[1]) // 1024
+    return None
+
+
+def memory_gate(available, limits, paused, pending_since, now):
+    if limits is None or available is None:
+        return False, None
+    pause, resume = limits
+    should_pause = available < resume if paused else available <= pause
+    if should_pause == paused:
+        return paused, None
+    if pending_since is None:
+        return paused, now
+    if now - pending_since >= MEMORY_HOLD_SECONDS:
+        return should_pause, None
+    return paused, pending_since
 
 
 def pressure(count, maximum, settings, paused=False):
@@ -167,28 +201,36 @@ def counters():
 
 def serve():
     firewall = Firewall()
-    paused, ports, refresh = False, set(), 0
+    conn_paused, mem_paused, pending = False, False, None
+    previous_memory, reasons, ports, refresh = None, [], set(), 0
     def stop(*_): raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
         while True:
             now = time.monotonic()
-            settings = policy()
+            settings, memory = read_policy()
             count, maximum = counters()
-            next_paused, budget = pressure(count, maximum, settings, paused)
-            if now >= refresh or next_paused != paused:
+            conn_paused, budget = pressure(count, maximum, settings, conn_paused)
+            available = memory_available() if memory is not None else None
+            if memory != previous_memory:
+                pending = None
+                previous_memory = memory
+            mem_paused, pending = memory_gate(available, memory, mem_paused, pending, now)
+            next_reasons = [name for name, paused in (('conntrack', conn_paused), ('memory', mem_paused)) if paused]
+            if now >= refresh or bool(next_reasons) != bool(reasons):
                 ports = discover_ports()
                 refresh = now + 15
-            firewall.apply(ports, next_paused)
-            state = {'pid': os.getpid(), 'count': count, 'kernel_max': maximum, 'budget': budget, 'paused': bool(ports and next_paused),
+            firewall.apply(ports, bool(next_reasons))
+            state = {'pid': os.getpid(), 'count': count, 'kernel_max': maximum, 'budget': budget, 'paused': bool(ports and next_reasons),
+                     'reasons': next_reasons, 'memory_available_mib': available,
                      'data_ports': sorted(ports), 'pause_at': budget * settings[1] // 100,
                      'resume_at': budget * settings[2] // 100, 'sample_unix': time.time()}
-            if next_paused != paused:
+            if next_reasons != reasons:
                 print(json.dumps(state), flush=True)
             STATUS.write_text(json.dumps(state) + '\n')
             STATUS.chmod(0o600)
-            paused = next_paused
+            reasons = next_reasons
             time.sleep(2)
     except KeyboardInterrupt:
         pass

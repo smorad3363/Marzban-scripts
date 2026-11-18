@@ -27,6 +27,28 @@ class AdmissionTests(unittest.TestCase):
             with mock.patch.object(Path, 'read_text', return_value='MemTotal: '+str(gib*1024**2)+' kB\n'):
                 self.assertEqual(guard.default_budget(), expected)
 
+    def test_memory_gate_debounces_both_transitions_and_keeps_hysteresis(self):
+        limits = (1280, 2304)
+        self.assertEqual(guard.memory_gate(1000, limits, False, None, 10), (False, 10))
+        self.assertEqual(guard.memory_gate(1400, limits, False, 10, 12), (False, None))
+        self.assertEqual(guard.memory_gate(1000, limits, False, 10, 17), (False, 10))
+        self.assertEqual(guard.memory_gate(1200, limits, False, 10, 18), (True, None))
+        self.assertEqual(guard.memory_gate(1800, limits, True, None, 22), (True, None))
+        self.assertEqual(guard.memory_gate(2400, limits, True, None, 24), (True, 24))
+        self.assertEqual(guard.memory_gate(2500, limits, True, 24, 32), (False, None))
+        self.assertEqual(guard.memory_gate(500, None, True, 24, 32), (False, None))
+
+    def test_optional_memory_settings_have_separate_validated_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'policy.json'
+            config = {'tracked_budget': 65536}
+            for memory in ({'pause_available_mib': 1280}, {'pause_available_mib': 2304, 'resume_available_mib': 1280}):
+                path.write_text(json.dumps(dict(config, memory=memory)))
+                with self.assertRaises(ValueError):
+                    guard.read_policy(path)
+            path.write_text(json.dumps(dict(config, memory={'pause_available_mib': 1280, 'resume_available_mib': 2304})))
+            self.assertEqual(guard.read_policy(path), ((65536, 75, 60), (1280, 2304)))
+
     def test_policy_rejects_typos_invalid_limits_and_wrong_types(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'policy.json'

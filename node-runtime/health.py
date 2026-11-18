@@ -196,7 +196,7 @@ def snapshot(directory):
             "disk_space": disk_space(directory), "disk_io": disk, "links": interfaces(), "protocols": tcp,
             "softnet": [[int(x, 16) for x in l.split()[:3]] for l in read("/proc/net/softnet_stat").splitlines()],
             "sockets": (read("/proc/net/sockstat") + "\n" + read("/proc/net/sockstat6")).strip().splitlines(),
-            "conntrack": conntrack, "admission": {k: admission[k] for k in ("paused", "budget", "pause_at", "resume_at", "sample_unix") if k in admission},
+            "conntrack": conntrack, "admission": {k: admission[k] for k in ("paused", "reasons", "memory_available_mib", "budget", "pause_at", "resume_at", "sample_unix") if k in admission},
             "gre": paths, "xray": xray_processes(), "port_samples": instances}
 
 

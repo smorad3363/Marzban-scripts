@@ -200,6 +200,21 @@ thresholds are recorded in `/run/marzban-node-admission.json`. Changes are
 validated and read during operation. Invalid settings stop the controller and
 clear its gate rather than leaving a stale rejection rule.
 
+For a node that has suffered a host-wide out-of-memory kill, configure an
+optional memory reserve in the same policy file:
+
+```json
+{"tracked_budget": 262144, "memory": {"pause_available_mib": 1280, "resume_available_mib": 2304}}
+```
+
+The threshold uses Linux `MemAvailable`. After eight seconds at or below the lower
+threshold, the same gate pauses new public Xray TCP sessions. It reopens after
+eight seconds at or above the upper threshold if conntrack pressure also allows it.
+Existing sessions continue and SSH, loopback and the node control ports remain
+reachable. The service status and performance history record the cause. Choose
+the memory thresholds for the host and omit the memory setting where no reserve
+is needed.
+
 This is admission backpressure, not a strict provider-side connection limit.
 An upstream host can already have tracked a SYN before the guest rejects it;
 the two-second sampling interval can also overshoot. Existing sessions, their
