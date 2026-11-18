@@ -138,6 +138,43 @@ runtime and image. Unsupported future module versions are rejected before the
 running node is stopped. The master-side fixes tested separately are not applied
 to a different master by this node installer.
 
+### Node performance history and GRE path MTU
+
+The node installer enables one host-wide `marzban-node-health.service`. It records
+one timestamped JSON sample per minute under `/var/log/marzban-node-health/samples.jsonl`.
+The directory holds up to eight 8 MiB files including the active file. Collection
+skips disk writes while less than 512 MiB is available and resumes automatically.
+`systemctl status marzban-node-health` shows the time and outcome of the latest sample.
+On container creation, the runtime also supplies Docker rotation for an unbounded
+`json-file` driver (8 MiB, up to three files). Existing rotation and custom drivers
+are respected. A running container takes new Docker log options on its next recreation.
+
+Samples include CPU and softirq per core, Xray CPU/RSS and cgroup pressure counters,
+memory, swap, system pressure, disk space and I/O, interface throughput/errors, RX queue RPS
+masks, qdisc drops, socket and protocol counters, UDP errors, TCP retransmissions,
+IPv4 fragmentation failures, conntrack occupancy and admission status. GRE Manager pairs
+include configured, live and kernel-reported route MTUs. Public port counts and queue
+sizes reuse the existing idle-guard snapshot. Per-port byte deltas cover sockets seen
+in both observations. The history contains aggregate counters and omits client endpoints,
+accounts and payloads. A raw snapshot is available immediately with:
+
+```bash
+sudo /usr/local/lib/marzban-node/health.py --once
+```
+
+If a foreign GRE pair has a verified smaller route MTU, the host helper can lower
+that one active pair using GRE Manager's existing transactional update. The kernel
+route must use that pair and report a smaller MTU of at least 1280. Applying a
+repair is explicit and GRE Manager saves the setting across reboots. Set the same
+value on the matching ingress pair so its TCP MSS rule follows the new MTU:
+
+```bash
+# On the node, replace PAIR_ID with the affected GRE Manager pair ID.
+sudo /usr/local/lib/marzban-node/health.py --apply-gre-pmtu PAIR_ID
+# On the ingress, use the same ID and the value printed on the node.
+sudo gremgr-pair set-mtu PAIR_ID OBSERVED_MTU
+```
+
 ### Connection admission budget
 
 The installer enables one host-wide `marzban-node-admission.service`. Every two

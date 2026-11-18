@@ -130,15 +130,40 @@ def save_state(path, data):
     os.replace(temporary, path)
 
 
-def run(container, state_path, idle_seconds=300, apply=False, limit=2000):
+def port_summary(current, previous, owned, ports, seconds):
+    result = {port: {"states": {}, "recvq_bytes": 0, "sendq_bytes": 0, "matched": 0,
+                     "matched_tx_bytes": 0, "matched_rx_bytes": 0} for port in ports}
+    for inode in owned & current.keys():
+        item = current[inode]
+        port = item["local"][1]
+        if port not in result:
+            continue
+        row = result[port]
+        state = item["state"]
+        row["states"][state] = row["states"].get(state, 0) + 1
+        row["recvq_bytes"] += item["queues"][0]
+        row["sendq_bytes"] += item["queues"][1]
+        old = previous.get(inode)
+        if old and old["local"] == item["local"] and old["peer"] == item["peer"]:
+            tx, rx = (new - before for new, before in zip(item["bytes"], old["bytes"]))
+            if tx >= 0 and rx >= 0:
+                row["matched"] += 1
+                row["matched_tx_bytes"] += tx
+                row["matched_rx_bytes"] += rx
+    return {"sample_unix": time.time(), "seconds": seconds, "ports": result}
+
+
+def run(container, state_path, idle_seconds=300, apply=False, limit=2000, summary_path=None):
     boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     previous = {}
+    seconds = None
     now = time.monotonic()
     if state_path.exists():
         state = json.loads(state_path.read_text())
         # JSON round trips lists; normalise addresses before comparisons.
         if state.get("boot") == boot and state.get("container") == container and 30 <= now - state.get("time", now) <= 180:
             previous = state.get("sockets", {})
+            seconds = round(now - state["time"], 2)
             for value in previous.values():
                 value["local"] = tuple(value["local"])
                 value["peer"] = tuple(value["peer"])
@@ -173,6 +198,13 @@ def run(container, state_path, idle_seconds=300, apply=False, limit=2000):
         closed = 0
     # Store node sockets only. Never retain other services' endpoint inventory.
     save_state(state_path, {"boot": boot, "container": container, "time": now, "sockets": {k: v for k, v in current.items() if k in owned}})
+    if summary_path is not None:
+        try:
+            admission = json.loads(Path("/run/marzban-node-admission.json").read_text())
+            ports = set(admission["data_ports"]) - protected
+            save_state(summary_path, port_summary(current, previous, owned, ports, seconds))
+        except (OSError, ValueError, KeyError):
+            pass  # An unavailable metrics sink must not interrupt socket cleanup.
     return {"container": container, "apply": apply, "idle_seconds": idle_seconds, "owned_tcp": len(set(current) & owned),
             "confirmed_idle": len(selected), "attempted": attempted, "closed": closed}
 
@@ -183,7 +215,8 @@ if __name__ == "__main__":
     parser.add_argument("--state", required=True, type=Path)
     parser.add_argument("--idle-seconds", type=int, default=300)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--port-summary", type=Path)
     args = parser.parse_args()
     if args.idle_seconds < 300:
         parser.error("Production idle timeout must be at least 300 seconds")
-    print(json.dumps(run(args.container, args.state, args.idle_seconds, args.apply)))
+    print(json.dumps(run(args.container, args.state, args.idle_seconds, args.apply, summary_path=args.port_summary)))

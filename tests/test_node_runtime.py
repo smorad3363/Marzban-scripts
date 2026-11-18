@@ -133,6 +133,7 @@ class MigrationTests(unittest.TestCase):
                       mock.patch.object(manager, "guard_paths", return_value={"guard": self.data / "idle_guard.py", "guard_service": self.root / "idle.service", "guard_timer": self.root / "idle.timer"}),
                       mock.patch.object(manager, "network_plan", return_value=({}, {})),
                       mock.patch.object(manager, 'connection_paths', return_value={'admission_script': self.data / 'admission.py', 'admission_service': self.root / 'admission.service'}),
+                      mock.patch.object(manager, "health_paths", return_value={"health_script": self.data / "health.py", "health_service": self.root / "health.service"}),
                       mock.patch.object(manager, "effective_memory", return_value=8 * 1024**3)]:
             patch.start()
             self.addCleanup(patch.stop)
