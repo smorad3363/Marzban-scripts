@@ -33,6 +33,18 @@ def default_budget():
     return 32768 if memory < 3 * 1024**3 else 65536 if memory < 7 * 1024**3 else 131072
 
 
+def default_memory_reserve():
+    """Reserve host memory for the kernel, sockets and non-Xray services.
+
+    Defaults scale with MemTotal, capped to avoid withholding disproportionate
+    amounts on large hosts. An explicit null in the policy disables the gate.
+    """
+    total = next(int(line.split()[1]) // 1024 for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemTotal:'))
+    pause = max(128, min(1024, total * 15 // 100))
+    resume = max(pause + 128, min(1536, total * 25 // 100))
+    return pause, resume
+
+
 def read_policy(path=POLICY):
     value = json.loads(path.read_text()) if path.exists() else {}
     if not isinstance(value, dict) or set(value) - {'tracked_budget', 'pause_percent', 'resume_percent', 'memory'}:
@@ -51,6 +63,8 @@ def read_policy(path=POLICY):
         memory = tuple(memory[key] for key in keys)
         if any(type(x) is not int for x in memory) or not 128 <= memory[0] < memory[1]:
             raise ValueError('Memory admission requires integer MiB limits with 128 <= pause < resume')
+    elif 'memory' not in value:
+        memory = default_memory_reserve()
     return (budget, pause, resume), memory
 
 
