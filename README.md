@@ -200,8 +200,10 @@ thresholds are recorded in `/run/marzban-node-admission.json`. Changes are
 validated and read during operation. Invalid settings stop the controller and
 clear its gate rather than leaving a stale rejection rule.
 
-For a node that has suffered a host-wide out-of-memory kill, configure an
-optional memory reserve in the same policy file:
+The memory reserve is enabled by default, including existing installations on
+upgrade. It uses 15% of host RAM (128–1024 MiB) to pause admission, and 25%
+(at least 128 MiB above the pause threshold, capped at 1536 MiB) to resume.
+An operator can override both thresholds in the same policy file:
 
 ```json
 {"tracked_budget": 262144, "memory": {"pause_available_mib": 1280, "resume_available_mib": 2304}}
@@ -212,8 +214,9 @@ threshold, the same gate pauses new public Xray TCP sessions. It reopens after
 eight seconds at or above the upper threshold if conntrack pressure also allows it.
 Existing sessions continue and SSH, loopback and the node control ports remain
 reachable. The service status and performance history record the cause. Choose
-the memory thresholds for the host and omit the memory setting where no reserve
-is needed.
+the memory thresholds for the host when needed. Omitted `memory` uses the
+adaptive default; explicit `"memory": null` opts out. The reserve is not a hard
+memory limit and cannot guarantee protection from growth in existing sessions.
 
 This is admission backpressure, not a strict provider-side connection limit.
 An upstream host can already have tracked a SYN before the guest rejects it;

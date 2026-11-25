@@ -27,6 +27,25 @@ class AdmissionTests(unittest.TestCase):
             with mock.patch.object(Path, 'read_text', return_value='MemTotal: '+str(gib*1024**2)+' kB\n'):
                 self.assertEqual(guard.default_budget(), expected)
 
+    def test_memory_reserve_defaults_scale_and_preserve_explicit_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'policy.json'
+            for mib, expected in [(512,(128,256)), (2048,(307,512)), (3915,(587,978)), (8192,(1024,1536)), (65536,(1024,1536))]:
+                with mock.patch.object(Path, 'read_text', return_value='MemTotal: '+str(mib*1024)+' kB\n'):
+                    self.assertEqual(guard.default_memory_reserve(), expected)
+                    self.assertEqual(guard.read_policy(path)[1], expected)
+            with mock.patch.object(guard, 'default_memory_reserve', return_value=(587,978)):
+                for config, expected in [({},(587,978)), ({'tracked_budget':32768},(587,978)), ({'memory':None},None), ({'memory':{'pause_available_mib':400,'resume_available_mib':800}},(400,800))]:
+                    path.write_text(json.dumps(config))
+                    self.assertEqual(guard.read_policy(path)[1], expected)
+
+    def test_memory_reserve_invariants(self):
+        for mib in range(512, 65537, 127):
+            with mock.patch.object(Path, 'read_text', return_value='MemTotal: '+str(mib*1024)+' kB\n'):
+                pause, resume = guard.default_memory_reserve()
+                self.assertTrue(128 <= pause < resume <= 1536)
+                self.assertLess(resume, mib)
+
     def test_memory_gate_debounces_both_transitions_and_keeps_hysteresis(self):
         limits = (1280, 2304)
         self.assertEqual(guard.memory_gate(1000, limits, False, None, 10), (False, 10))
